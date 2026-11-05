@@ -1,4 +1,5 @@
 name: Source regressions
+run-name: Source regressions (${{ github.ref_name }})
 
 on:
   push:
