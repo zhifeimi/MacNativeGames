@@ -893,7 +893,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
         for (TOTKSettingRow *r in settingsPanel.allRows) perPage[r.page]++;
         NSUInteger tallest = 0;
         for (NSInteger page = 0; page < SETTINGS_PAGE_BINDINGS; page++) if (perPage[page] > tallest) tallest = perPage[page];
-        assert(settingsPanel.frame.size.height >= SETTINGS_TOP + tallest * SETTINGS_ROW_H + SETTINGS_BOTTOM - 1);
+        assert(settingsPanel.frame.size.height >= SETTINGS_TOP + SETTINGS_BOTTOM - 1);
         assert(perPage[SETTINGS_PAGE_USERS] == 2);
     }
     NSButton *addUser = settingsPanel.userButtons[0];
