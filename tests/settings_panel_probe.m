@@ -893,7 +893,11 @@ int main(int argc, const char **argv) { @autoreleasepool {
         for (TOTKSettingRow *r in settingsPanel.allRows) perPage[r.page]++;
         NSUInteger tallest = 0;
         for (NSInteger page = 0; page < SETTINGS_PAGE_BINDINGS; page++) if (perPage[page] > tallest) tallest = perPage[page];
-        assert(settingsPanel.frame.size.height >= SETTINGS_TOP + SETTINGS_BOTTOM - 1);
+        /* Short screens compact rows to 24 pt with 2 pt gaps, then scroll below that. Require the minimum full layout
+           or all available room, not uncompressed 34 pt rows. */
+        CGFloat minimum = SETTINGS_TOP + tallest * (24 + 2) - 2 + SETTINGS_BOTTOM;
+        CGFloat room = window.contentView.bounds.size.height - 8;
+        assert(settingsPanel.frame.size.height >= fmin(minimum, room) - 1);
         assert(perPage[SETTINGS_PAGE_USERS] == 2);
     }
     NSButton *addUser = settingsPanel.userButtons[0];
