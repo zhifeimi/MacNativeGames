@@ -89,6 +89,18 @@ compare-and-swap loops that retry inside the window. `prepare_runtime.py`, `prep
   (29-30 FPS) gave the same speed, within one 30 fps frame, for the inventory tab animations (R, L), the typed item
   text and the jump poses (X, 100 ms steps). A frame-driven animation would be 4 times slower. At 30 fps the inventory
   opens about 80-120 ms later (about 3 frames), then runs at the same rate.
+- Moving platforms above 30 fps (`patch_kf_angle`, user report 2026-11-13): on Vah Medoh, Link hopped in place while the
+  beast tilted, more the higher the frame rate, and not at 30+30. The bodies the game moves (a Divine Beast's floor,
+  lifts, gates) get each physics step the angular velocity toward their target from hkQuaternion::getAngle
+  (main+0xb06d4, 2 acos(|w|), called at main+0x12d57fc). Under about half a milliradian w rounds to 1.0 and the turn
+  reads as none, so at high frame rates the floor stood still for some steps and then caught up. The call now goes to a
+  veneer (text padding +0x300) that returns 2 atan2(|xyz|, |w|) through the game's own atan2f import. Cause and cure
+  were found by Phosquitos for SavageWindRecomp ([pull request #312](https://github.com/Revivedx/SavageWindRecomp/pull/312),
+  issue #209 there). `verify_kf_angle_patch.py` assembles the veneer's actual words and executes them on Apple silicon,
+  comparing with `acosf` as a negative control; it needs no game data or CPU emulator. An optional original main image
+  also checks the patch guards and padding. The original angle loses small turns when w rounds to 1.
+  The PR author reported Link standing still on a tilting Medoh at 60+60 and uncapped. `TOTK_KF_ANGLE=0` keeps the shipped
+  angle.
 - Docked play renders at 1920x1080, as upstream's 1.6.0 port does: the display-mode routine main+0x1266074, `movk` at
   main+0x12660c8. `TOTK_RENDER_RES=900` keeps 1600x900.
 - While a movie plays (movie player instance main+0x1e565a8), the pacing holds 30 fps. Every movie frame is shown
@@ -523,6 +535,40 @@ keeps its 1280x720 canvas (main+0x1e43dd0, unchanged). Key 4 (21:9) does not wid
 1920x1080 on this build: the game writes 16:9 back into the camera's aspect field every frame. That is a separate open
 item.
 
+## The sound's clock above 60 fps (2026-11-24)
+
+Once a frame `main+0x1550fcc` hands the sound system the VFR's delta frame (`main+0x59c788`), at least 0.5, in console
+frames. It steps the audio frame (`main+0xf07808`) and is stored at `+0x84` of `[main+0x1e37038]`, the field that 1.6.0's
+`patch_slink_rate` stores (floor 1.0 there). The floor is a 60 fps frame, so above 60 fps it sets every frame and the
+sound's clock runs fast: every sound timer and fade, and the field battle music, which then starts each segment while
+the last one still plays. Cause and cure as found by
+[Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp) (MIT, its #145); no code is copied.
+
+`patch_sound_frame` makes the floor 0.5 x the frame-step page's ratio (the frame's length in 30 fps frames), through a
+veneer at text padding `+0x360`: 0.5 at 30 fps as shipped, so slow motion and a stopped game keep the console's half a
+second of sound clock a second, and the frame's own length above. `TOTK_SOUND_FRAME=0` keeps it as shipped. Mac only: it
+returns early under `ios_code()`, so the iOS export does not change. `TOTK_SOUND_FRAME_LOG=1` puts a `brk` on the select
+(`fcsel s8, s1, s0, mi`, `main+0x155100c`) and logs once a second the game's and the sound's seconds against the real
+time, the delta's range, the floor and how many frames it set.
+
+Run on 2026-11-24, M5 Pro, the newest save (slot 2), copies of the profile and cache, standing still for about 50 s after
+the load. Seconds of clock per real second, averaged over the run after its first 3 s:
+
+| Build | Frame lock | Delta per frame | Floor | Frames the floor set | Game | Sound |
+|---|---|---|---|---|---|---|
+| main + log | 30 | 0.96-1.03 | 0.5 | none | x0.988 | x0.988 |
+| main + log | 120 | 0.22-0.35 | 0.5 | all | x0.999 | x1.833 |
+| fix | 120 | 0.22-0.30 | 0.11-0.15 | none | x1.000 | x1.000 |
+| fix, `TOTK_SOUND_FRAME=0` | 120 | 0.22-0.31 | 0.5 | all | x1.000 | x1.900 |
+| fix | 30 | 0.97-1.02 | 0.48-0.51 | none | x1.000 | x1.000 |
+
+The cause was measured, the symptom was not heard: the save has no enemies near, so the battle music did not play. To
+compare by ear, `TOTK_SOUND_FRAME=0` brings the shipped floor back. `games/botw/scripts/verify_sound_frame_patch.py`
+runs the game's select with Unicorn at 30, 60, 120, 144 and 240 fps: patched, the sound's clock runs at x1.0 at every
+rate (shipped: x1.0, x1.0, x2.0, x2.4, x4.0); with the delta at 30%, 10% and 0% of the frame (slow motion, a stopped
+game) it runs at x0.5 at every rate, as shipped at 30 fps; at a ratio of exactly 1.0 its result is the shipped one, bit
+for bit.
+
 ## Audio: volume ramps and depop (2026-10-22)
 
 The mixer applied a new voice volume or channel mix volume as a step at the 5 ms frame edge, and a stopped or paused
@@ -553,6 +599,33 @@ stopped voice's last samples (Ryujinx.Audio `CommandGenerator.GenerateVoice`: `V
 - Not tested: a listening test by the owner (pause menu, map, shrine, fast travel) and splitter voices (BOTW opens none).
 - A run that ends in Game Over has no world sound (digital zero): the first runs of this check, started from the legs
   save on a build without the legs cure, were silent for that reason.
+
+## Arrows above 30 fps (2026-11-24)
+
+Once an arrow falls, each update makes its velocity the last one's direction times its speed (`+0xb4`) plus the gravity
+vector (`+0x104..+0x10c`), in metres per console frame, with no time step. Every update turns it down by the same angle,
+so at 120 fps it turned four times as fast a second and landed short. Cause and cure as found by
+[Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp) (MIT, its #144); no code is copied.
+
+`patch_arrow_gravity` multiplies the gravity by the frame-step page's ratio (the frame's length in 30 fps frames, 1.0 at
+30 fps), through a veneer at text padding `+0x340`. `TOTK_ARROW_GRAVITY=0` keeps it as shipped. Mac only: it returns
+early under `ios_code()`, so the iOS export does not change. `TOTK_ARROW_LOG=1` puts a `brk` on `main+0x5ee738` and logs
+each update (ratio, gravity, velocity).
+
+Run on 2026-11-24, M5 Pro, the newest save (slot 2), copies of the profile and cache, three shots held with ZR from the
+same spot. The turn is the pitch's least-squares slope over the first 0.6 s of each arrow:
+
+| Build | Frame lock | Updates a second | Speed (m / console frame) | Gravity per update | Turn (degrees a second, 3 arrows) |
+|---|---|---|---|---|---|
+| main + log | 30 | 31 | 0.999 | -0.01089 | -18.6, -18.8, -18.6 |
+| main + log | 120 | 118-120 | 0.997 | -0.01089 | -72.9, -72.8, -70.8 |
+| fix | 120 | 117-119 | 0.999 | -0.0027 to -0.0033 | -18.5, -18.5, -18.5 |
+| fix, `TOTK_ARROW_GRAVITY=0` | 120 | 113-120 | 0.996 | -0.01089 | -70.6, -72.2, -73.5 |
+
+With the fix, an arrow stayed in the air about 3 s before it hit something; as shipped at 120 fps, about 1.2 s.
+`games/botw/scripts/verify_arrow_gravity_patch.py` runs the game's own update for one second at 30, 60, 120, 144 and
+240 fps: patched, the pitch after a second is -4.29 degrees at every rate; shipped, -4.29, -8.56, -16.9, -20.2 and
+-32.5.
 
 ## Not tested and known issues
 

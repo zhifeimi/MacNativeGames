@@ -1,5 +1,10 @@
 # 圣兽之王的独立原生运行时；游戏数据和生成文件保存在工作目录。
 
+# opus and libvpx come from the repository's tools/deps: made once per Mac from pinned sources (no Homebrew).
+# make runs here (games/<game>); set a *_PREFIX to use another build.
+OPUS_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix opus),$(error tools/deps could not make opus))
+VPX_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix libvpx),$(error tools/deps could not make libvpx))
+
 WORK ?= $(HOME)/Games/Unicorn-build-1.05
 OUT := $(WORK)/build
 PY ?= python3
@@ -25,10 +30,14 @@ $(OUT)/obj/%.o: % $(GFX_HEADERS) Makefile
 	@mkdir -p "$(dir $@)"
 	xcrun clang $(NATIVE_OPT) -g -Wall -Wextra $(GFX_FLAGS) -c "$<" -o "$@"
 
+# The game binary and its launcher run on macOS 26 whatever SDK builds them: with no minimum, clang and ld take the
+# SDK's version (Launcher 1.1.5, made on macOS 27, carried runtimes of minos 27.2 that macOS 26 refused, #2395). Set only on
+# these targets (make passes it to what they are made of): the translator and spirv-cross targets keep their own flags.
+$(OUT)/unicorn-native: export MACOSX_DEPLOYMENT_TARGET := 26.0
 $(OUT)/unicorn-native: $(RUNTIME_SRC) $(RUNTIME_HEADERS) $(GENERATED) $(GFX_OBJECTS) Makefile
 	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations \
-	  -Ithird_party/d2r_gfx/gfx/nvn/include -I$(OUT) -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include \
-	  $(RUNTIME_SRC) $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a \
+	  -Ithird_party/d2r_gfx/gfx/nvn/include -I$(OUT) -I$(OPUS_PREFIX)/include/opus -I$(VPX_PREFIX)/include \
+	  $(RUNTIME_SRC) $(GFX_OBJECTS) $(OPUS_PREFIX)/lib/libopus.a $(VPX_PREFIX)/lib/libvpx.a \
 	  -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics \
 	  -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation \
 	  -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
@@ -56,7 +65,8 @@ boot: runtime shader-tools
 	cd "$(WORK)" && TOTK_GPU_ALLOW_SUBMIT=1 ./build/unicorn-native rewritten/v262144 boot > "$(abspath $(UNICORN_LOG))" 2>&1
 
 APP ?= $(WORK)/圣兽之王.app
-$(OUT)/launcher: app/launcher.m runtime/game_version.h
+$(OUT)/launcher: export MACOSX_DEPLOYMENT_TARGET := 26.0
+$(OUT)/launcher: app/launcher.m runtime/game_version.h Makefile
 	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -fobjc-arc app/launcher.m -framework Cocoa -o "$@"
 
 .PHONY: app
@@ -69,8 +79,8 @@ app: runtime shader-tools $(OUT)/launcher
 
 $(OUT)/test-opus-multistream: tests/opus_multistream.c runtime/opus_multistream.c runtime/runtime.h
 	@mkdir -p "$(dir $@)"
-	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -Iruntime -I/opt/homebrew/opt/opus/include/opus \
-	  tests/opus_multistream.c runtime/opus_multistream.c /opt/homebrew/opt/opus/lib/libopus.a -o "$@"
+	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -Iruntime -I$(OPUS_PREFIX)/include/opus \
+	  tests/opus_multistream.c runtime/opus_multistream.c $(OPUS_PREFIX)/lib/libopus.a -o "$@"
 
 .PHONY: test-opus
 test-opus: $(OUT)/test-opus-multistream

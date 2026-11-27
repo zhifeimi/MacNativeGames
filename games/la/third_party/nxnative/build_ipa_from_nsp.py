@@ -23,7 +23,7 @@
 #   this build's shaders, where git ignores them, and a reused step makes them again when they do not name its libraries' stamp (chain_tables).
 # The shader translator is the in-repo dm/gfx/tools/dmsh_xlate_bin (the build whose fingerprints match dmsh_chain.lock; a rebuilt dll has different fingerprints and dmsh_build refuses it; its launcher is universal, so an Intel Mac runs it too). The Metal compiler and spirv-cross may be other than the lock's: the iOS shaders
 #   are built through dm/gfx/tools/own_compilers.py, which says so in one line and leaves the lock and the chain version as they are.
-# The Python running this file needs lz4, capstone and fonttools (and backports.zstd before Python 3.14); also needed: Xcode, xcodegen, .NET SDK 10, zstd, spirv-cross. A first run takes 2 (Metroid Dread) to 10 minutes (Breath of the Wild: 5 of them the shader split), longer when shader libraries must be compiled; a repeat run with unchanged inputs takes about 20 s (Metroid Dread), mostly packing the IPA. Key values are never printed.
+# The Python running this file needs lz4, capstone and fonttools (and backports.zstd before Python 3.14); also needed: Xcode. xcodegen, .NET SDK 10, zstd and spirv-cross (and glslangValidator for an OpenGL game) come from MacNativeGames' tools/deps, which makes them once per Mac from pinned sources; this target's scripts/build_<game>.py puts them first on PATH and names its .NET in DOTNET_ROOT (no Homebrew). A first run takes 2 (Metroid Dread) to 10 minutes (Breath of the Wild: 5 of them the shader split), longer when shader libraries must be compiled; a repeat run with unchanged inputs takes about 20 s (Metroid Dread), mostly packing the IPA. Key values are never printed.
 # The console shows one line per stage ([k/n] stage, with a bar, done/total, percent, elapsed time and ETA where the work can be counted); the tools' own output goes only to logs/ (PROGRESS / --progress). --progress json writes newline-delimited JSON events to stdout.
 import ast, collections, ctypes, getpass, hashlib, json, os, re, shlex, shutil, struct, subprocess, sys, tempfile, threading, time, types, zlib
 from pathlib import Path
@@ -56,7 +56,7 @@ HEAP_CHECK_NNMAIN_SECS = 5
 PROGRESS = 'auto'                       # stage lines on the console: 'bar' (one line per stage, redrawn in place), 'lines' (a plain line every BEAT seconds), 'off' (only each stage's start and end); 'auto' = bar in a terminal or Spyder, lines when the output goes to a file; 'json' = one JSON event per line, for a program that shows the build
 BEAT = 30                               # seconds between progress lines in 'lines' mode
 LA_TITLE, LA_PACKAGE, LA_PINS = '01006BB00C6F0000', 'v131072', 'assets/expected-1.1.0.json'   # this target's one game and version
-TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/local/share/dotnet', os.path.expanduser('~/.dotnet')]   # GUI apps such as Spyder do not get the shell's PATH
+TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin']   # GUI apps such as Spyder do not get the shell's PATH; after the caller's PATH, which starts with MacNativeGames' tools/deps (xcodegen, dotnet, zstd, spirv-cross)
 
 
 class BuildError(Exception):
@@ -711,7 +711,8 @@ def profile_files(g):   # every file of the game profile (game.tsv and its table
 def check_prereqs(env, xlate, mac=False):   # mac: a Mac-only build (PLATFORM 'mac'), which needs no xcodegen and compiles shaders only for macOS
     missing = [m for m in ('lz4.block', 'capstone', 'fontTools') if not _importable(m)] + ([] if _importable('compression.zstd') or _importable('backports.zstd') else ['backports.zstd'])   # zstd: built in from Python 3.14
     if missing: raise BuildError(f'the current Python ({sys.executable}) is missing modules: {", ".join(missing)} (pip install lz4 capstone fonttools backports.zstd; backports.zstd only before Python 3.14)')
-    tools = {'xcodebuild': 'Xcode', 'xcodegen': 'brew install xcodegen', 'dotnet': '.NET SDK 10', 'zstd': 'brew install zstd', 'spirv-cross': 'brew install spirv-cross', 'make': 'Xcode'}
+    deps = "comes with the build: MacNativeGames' tools/deps, which scripts/build_<game>.py puts first on PATH"   # MacNativeGames: no Homebrew
+    tools = {'xcodebuild': 'Xcode', 'xcodegen': deps, 'dotnet': deps, 'zstd': deps, 'spirv-cross': deps, 'make': 'Xcode'}
     if mac: del tools['xcodegen']
     gone = [f'{t} ({how})' for t, how in tools.items() if not shutil.which(t, path=env['PATH'])]
     if gone: raise BuildError('tools not found: ' + ', '.join(gone))
@@ -977,53 +978,9 @@ def ue_stamp(d):   # what an extraction's decoded shader archives were made from
 
 
 def decode_ue_shaders(repo, dirs, pkg_ver, patched, work, env, logs, g):
-    """A game with Unreal paks (Octopath Traveler 0): Unreal Engine keeps its shaders in the shader code archives of its paks, each shader Oodle-compressed, and only the game's own Oodle
-    decodes them. dm/gfx/tools/uepak.py takes the archives out of the paks (the pak index is AES-encrypted with a key from main) and writes one Oodle job; the game's code decodes it in the Mac host
-    (DM_OODLE_JOB, dm/host/hle_oodle.c: right before nnMain, then the host exits), and the decoded archives go to <version dir>/ue_shaders, where shader_split.py reads them.
-    The job runs the packed version's code (Oodle's format does not change between builds). Unreal Engine 4.26 and later compress shaders with LZ4 by default (DRAGON QUEST VII Reimagined),
-    which uepak.py decodes itself, so such a game needs no host run here. Unreal Engine 5.6 (FINAL FANTASY RESONANCE) keeps its shader libraries in the IoStore container instead, two layers
-    of Oodle (container blocks, then each shader group): uepak.py reads them through the game's Oodle in the host's tool mode (uepak.OodleHost), with no boot. A folder whose stamp matches its paks is reused"""
-    sys.path.insert(0, str(repo / 'dm/gfx/tools')); import uepak
-    todo = {v: d for v, d in dirs.items() if not ((d / 'ue_shaders/stamp').exists() and (d / 'ue_shaders/stamp').read_text() == ue_stamp(d))}
-    PROG.stage('UE shader decode')
-    if not todo:
-        say(f'reusing the decoded shader archives: {", ".join(str(d / "ue_shaders") for d in dirs.values())}')
-        PROG.end('reused'); return
-    t0, total, host = time.time(), 0, None
-    for v, d in todo.items():
-        jd, rd, log = work / f'tmp/ue_job_{v}', work / 'tmp/ue_run', logs / f'ue_decode_{v}.log'
-        rmtree(jd); rmtree(rd)
-        for s in ('save', 'temp'): (rd / s).mkdir(parents=True)
-        dec = None
-        if uepak.io_shader_tocs(str(d / 'RomFS')):
-            if not host:
-                PROG.set(step='building the Mac host')
-                host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
-            dec = uepak.OodleHost(host, patched, env)
-        PROG.set(step=f'{v}: shader archives out of the paks' + (' and IoStore containers' if dec else ''))
-        try: listing, n = uepak.job(str(d / 'RomFS'), str(d / 'ExeFS/main'), str(jd), decode=dec)
-        finally:
-            if dec: dec.close()
-        if not listing: raise BuildError(f'the RomFS has Unreal paks, but none under {d / "RomFS"} holds a shader code archive: where the shaders are has to be found first')
-        say(f'{v}: ' + '; '.join(f'{x["name"]} {x["shaders"]:,} shaders' + (f' ({x["compression"]})' if x.get('compression') else '') for x in listing)
-            + (f'; decoding {n:,} with the game\'s Oodle in the Mac host' if n else ''))
-        if n:   # Oodle-compressed shaders (Octopath Traveler 0); LZ4 ones (Unreal Engine 4.26 and later by default) are decoded by uepak.py already
-            if not host:
-                PROG.set(step='building the Mac host')
-                host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
-            PROG.set(step=f'{v}: decoding {n:,} shaders in the Mac host')
-            henv = dict(env, DM_ROMFS=str(dirs[pkg_ver] / 'RomFS'), DM_SAVE=str(rd / 'save'), DM_TEMP=str(rd / 'temp'), DM_MSL_DIR=str(rd / 'msl'), DM_OODLE_JOB=str(jd / 'oodle.job'))
-            rc = boot_mac(host, patched, henv, rd, log, UE_DECODE_SECS)
-            if rc != 0 or not (jd / 'oodle.job.out').exists():
-                PROG.end(ok=False)
-                PROG.say(f'---- last lines of {log} ----\n' + ''.join(collections.deque(open(log, errors='replace'), maxlen=20)).rstrip('\n'))
-                raise BuildError(f'the Oodle decode run stopped with exit {rc} (host output: {log})')
-        out = d / 'ue_shaders.partial'; rmtree(out)
-        uepak.finish(str(jd), str(out)); (out / 'stamp').write_text(ue_stamp(d))
-        swap_in(out, d / 'ue_shaders'); rmtree(jd); rmtree(rd); total += n + sum(x['shaders'] for x in listing if x['compression'] == 'IoStore, decoded')
-    PROG.end(f'{total:,} shaders in {hms(time.time() - t0)}')
-
-
+    """Unreal Engine games are not supported: their pak reader (uepak.py), which opened a pak's encrypted index with a key found in the game's
+    code, was removed (user 2026-11-20: "我们不需要 就去掉 删")."""
+    raise BuildError('the game has Unreal Engine paks: Unreal Engine games are not supported (their pak reader was removed)')
 CAPTURE_SECS = 120   # the longest run-time shader capture: Super Mario Galaxy creates its 3,089 Vulkan modules within 6 s of its first one (about 15 s after boot on an M4 Pro)
 # Run-time shader captures, by graphics API: the host's switch, the profile's table of the keys a capture must hold, and a capture file's name → its key (None: not a whole file;
 # the host writes each under a temporary name and renames it). Vulkan: <16 hex>.spv (dm/gfx/vk/hle_vk.m); GL: <16 hex>.vert / .frag (dm/gfx/gl/hle_gl.m sh_capture)
@@ -1373,7 +1330,7 @@ def build_gl_shaders(py, repo, roots, sh, env, logs, g, reuse=True, mac=False):
     """An OpenGL game's GLSL sources (roots: the RomFS, main, a run-time capture folder) → one Metal library each for the Mac (sh/gl/) and the iPhone (sh/ios/gl/, what build_ipa.sh takes from MSL_IOS;
     not with mac), replacing the NVN split and chain build, as build_vk_shaders does for a Vulkan game; glslang (glslangValidator) compiles the GLSL to SPIR-V for spirv-cross"""
     PROG.stage('GL shaders', step='checking the inputs')
-    if not shutil.which('glslangValidator', path=env['PATH']): raise BuildError('glslangValidator not found (brew install glslang): it compiles an OpenGL game\'s GLSL shaders')
+    if not shutil.which('glslangValidator', path=env['PATH']): raise BuildError('glslangValidator not found (MacNativeGames\' tools/deps makes it: put the folder `python3 tools/deps path glslangValidator` prints first on PATH): it compiles an OpenGL game\'s GLSL shaders')
     key = fingerprint(*[('tree', r) if Path(r).is_dir() else ('files', [r]) for r in roots], ('files', tool_files(repo)), ('files', profile_files(g)), *toolchain(),
                       ('cmd', ['glslangValidator', '--version']), env=env) if reuse else None
     return layer_shaders(py, repo, 'gl', 'GL', roots, sh, key, logs, env, mac)

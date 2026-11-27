@@ -10,11 +10,12 @@ totk-native-v4-unverified, third_party/d2r_gfx/gfx/nvn/dmsh_chain.h) and the gam
     the runtime would answer them (totk_shader_rt.m totk_rt_variant: the variant is the shader key plus the SHA-256 of
     its answers as compact sorted JSON; deps_match picks a variant without wildcards, defaults 2d / float);
   - the seed holds only the files the runtime's import accepts (totk_shader_seed.h): <key>.variants,
-    <variant>_b.metal / _b.json and pso_manifest.tsv, named in seed-manifest.json with their SHA-256.
+    <variant>_b.metal / _b.json and pso_manifest.tsv (its shaders, then the list's render pipelines whose shaders it
+    holds), named in seed-manifest.json with their SHA-256.
 The output contains game-derived data and belongs in the work folder, never in the repo.
 
-  prepare_shader_seed.py --romfs <work>/extracted/v100/romfs --output <work>/build/shader-seed \\
-      --translator <work>/build/shader-service/totk_xlate --spirv-cross <work>/build/spirv-cross/spirv-cross --version v100
+  prepare_shader_seed.py --romfs <work>/extracted/v210/romfs --output <work>/build/shader-seed \\
+      --translator <work>/build/shader-service/totk_xlate --spirv-cross <work>/build/spirv-cross/spirv-cross --version v210
 """
 import argparse
 import concurrent.futures
@@ -31,10 +32,10 @@ import threading
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from shader_list import ShaderList   # noqa: E402
+from shader_list import NAME, ShaderList   # noqa: E402
 
 CHAIN = 'totk-native-v4-unverified'
-MIN_SHADERS = 900   # of the 1,010 unique shaders of 1.0.0: fewer means the scan or the translator went wrong
+MIN_SHADERS = 900   # of the 1,010 unique shaders of 2.1.0 (the same as 1.0.0's): fewer means the scan or the translator went wrong
 LIST = Path(__file__).resolve().parents[1]/'assets/shader_list.tsv'
 CONTROL_MAGIC = struct.pack('<I', 0x98761234)
 CODE_MAGIC = struct.pack('<I', 0x12345678)
@@ -43,6 +44,37 @@ STAGES = {0: 'vs', 1: 'ps', 5: 'cs'}
 ANSWERS = dict(tex={}, img={}, attr={}, fout={})
 DEFAULTS = dict(tex='2d', img={}, attr='float', fout='float')   # totk_shader_rt.m deps_match
 DEPTH_MINUS_W = True   # nvnDeviceSetDepthMode NEAR_IS_MINUS_W: the Mac's own vertex translations have the clip-z conversion
+
+
+def code_digest(path):
+    """SHA-256 of a program's code, the same whatever signed it: a thin 64-bit Mach-O up to its code signature, with the
+    three sizes the signature sets zeroed (__LINKEDIT's vmsize and filesize, LC_CODE_SIGNATURE's datasize); anything
+    else hashed whole. MNG Launcher ships the translator signed with a Developer ID whose signature carries a time stamp,
+    so every release is another file of the same code; named by the whole file, a Launcher build and a command-line
+    build of one work folder emptied each other's translation cache, and every code update did it for players
+    (2026-11-18). The same as games/oot/scripts/prepare_ns2_seed.py code_sha256 and totk_rt_translator.h totk_code_sha256."""
+    data = bytearray(Path(path).read_bytes())
+    whole = hashlib.sha256(bytes(data)).hexdigest()
+    if len(data) < 32 or struct.unpack_from('<I', data, 0)[0] != 0xfeedfacf:
+        return whole
+    ncmds, sizeofcmds = struct.unpack_from('<II', data, 16)
+    at, end, sig = 32, 32 + sizeofcmds, None
+    for _ in range(ncmds):
+        if at + 8 > end:
+            return whole
+        cmd, size = struct.unpack_from('<II', data, at)
+        if size < 8 or at + size > end:
+            return whole
+        if cmd == 0x19 and data[at + 8:at + 24].rstrip(b'\0') == b'__LINKEDIT':   # LC_SEGMENT_64
+            struct.pack_into('<Q', data, at + 32, 0)   # vmsize
+            struct.pack_into('<Q', data, at + 48, 0)   # filesize
+        elif cmd == 0x1d:   # LC_CODE_SIGNATURE
+            sig = struct.unpack_from('<I', data, at + 8)[0]
+            struct.pack_into('<I', data, at + 12, 0)   # datasize
+        at += size
+    if sig is None or sig > len(data):
+        return whole
+    return hashlib.sha256(bytes(data[:sig])).hexdigest()
 
 
 def digest(data):
@@ -134,6 +166,9 @@ def translation_request(variant, stage, control, code, answers, code_path):
                    depth_minus_w=DEPTH_MINUS_W, **answers)
     if stage == 'cs':
         request['local'] = list(struct.unpack_from('<III', control, 0x748))
+        shared = (struct.unpack_from('<I', control, 0x754)[0] + 15) // 16 * 16   # compute_shared.h: the kernel's shared memory,
+        if 4096 < shared <= 32768:   # given only above the translator's 4 KiB default
+            request['shared'] = shared
     return request
 
 
@@ -205,6 +240,23 @@ def builtin_serves(seed, key, deps):
     return deps_match(made, answers_for(json.loads(deps) if isinstance(deps, str) else deps))
 
 
+def warm_pipelines(shader_list, prepared):
+    """The list's render pipelines (R rows, as recorded) whose vertex and fragment variants this seed holds, in list
+    order: the runtime's warm-up builds them before play (nvn_mtl.m warm_start reads the imported pso_manifest.tsv), so
+    the first scenes do not build them on the submit thread. A row naming a shader the seed lacks is left out."""
+    if not shader_list.is_file():
+        return []
+    out = []
+    for row in ShaderList.load(shader_list).warm:
+        if row[0] != 'R':
+            continue
+        key = bytes.fromhex(row[1])
+        names = [key[at:at+NAME].partition(b'\0')[0].decode('ascii', 'replace') for at in (0, NAME)]
+        if names[0] in prepared and (not names[1] or names[1] in prepared):
+            out.append(row[1])
+    return out
+
+
 def plan(shaders, listed):
     """Jobs (key, answers, variant, why): the default bind state of every shader, then each state the list names for a
     shader of this game."""
@@ -221,7 +273,7 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None):
     listed = ShaderList.load(shader_list).variants
     identity = dict(schema=1, chain=CHAIN, version=version, game='dread',
                     source_romfs_sha256=json.loads((romfs/'index.json').read_text())['romfs_sha256'],
-                    translator_sha256=digest(translator.read_bytes()),
+                    translator_code_sha256=code_digest(translator),   # its code, any signature (2026-11-18)
                     spirv_cross_sha256=digest(spirv_cross.read_bytes()),
                     preparation_sha256=digest(Path(__file__).read_bytes()),
                     shader_list_sha256=digest(shader_list.read_bytes()) if shader_list.is_file() else None)
@@ -235,7 +287,7 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None):
     staging.mkdir(parents=True)
     shaders, archives = inventory(romfs)
     cache = TranslationCache(output.with_name(output.name+'.translations'), dict(
-        schema=1, chain=CHAIN, translator_sha256=identity['translator_sha256'],
+        schema=1, chain=CHAIN, translator_code_sha256=identity['translator_code_sha256'],
         spirv_cross_sha256=identity['spirv_cross_sha256'],
         request_sha256=digest(inspect.getsource(translation_request).encode())))
     jobs = plan(shaders, listed)
@@ -324,6 +376,8 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None):
         raise ValueError(f'only {ready} shaders prepared; at least {MIN_SHADERS} were expected')
     rows = [f'S\t{variant}_b\t'+str({'vs': 0, 'ps': 1, 'cs': 5}[stage]) for _, variant, stage in completed]
     rows += [f'C\t{variant}_b' for _, variant, stage in completed if stage == 'cs']
+    pipelines = warm_pipelines(shader_list, {variant+'_b' for _, variant, _ in completed})
+    rows += ['R\t'+key for key in pipelines]
     (staging/'pso_manifest.tsv').write_text('# Prepared from this app\'s local game data; '+CHAIN+'\n'+'\n'.join(rows)+'\n')
     wanted = {'pso_manifest.tsv'}
     for _, variant, _ in completed:
@@ -331,8 +385,9 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None):
     for p in staging.iterdir():   # failed translations can leave MSL behind: never a cached shader
         if p.name not in wanted:
             p.unlink()
-    report = dict(**identity, shaders=len(completed), discovered=len(shaders), startup_shaders=ready, all_default=True,
-                  listed_variants=sum(1 for job in jobs if job[3] == 'listed'), skipped=failed, archives=archives,
+    report = dict(**identity, translator_sha256=digest(translator.read_bytes()), shaders=len(completed), discovered=len(shaders), startup_shaders=ready, all_default=True,
+                  listed_variants=sum(1 for job in jobs if job[3] == 'listed'), warm_pipelines=len(pipelines),
+                  skipped=failed, archives=archives,
                   seconds=time.monotonic()-started,
                   files={p.name: digest(p.read_bytes()) for p in sorted(staging.iterdir())})
     (staging/'seed-manifest.json').write_text(json.dumps(report, indent=2)+'\n')
@@ -340,7 +395,7 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None):
     staging.rename(output)
     cache.prune({job[2] for job in jobs})
     print(f'shader seed ready: {len(completed)} variants of {ready} shaders ({report["listed_variants"]} listed bind '
-          f'states), {len(failed)} skipped; {done[2]} from the translation cache, {done[0]+done[1]-done[2]} translated '
+          f'states, {len(pipelines)} warm pipelines), {len(failed)} skipped; {done[2]} from the translation cache, {done[0]+done[1]-done[2]} translated '
           f'in {report["seconds"]:.0f}s', flush=True)
     return report
 

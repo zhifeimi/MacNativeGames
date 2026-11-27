@@ -7,6 +7,7 @@
 //   ~/Library/Logs/MacNativeGames/totk.log             this run, only with the debug log on (totk.previous.log: the one before; botw.log for Breath of the Wild)
 // If the game is already running, the launcher only brings it to the front.
 #import <AppKit/AppKit.h>
+#import <AVFAudio/AVFAudio.h>
 #import <GameController/GameController.h>
 #include <IOKit/hid/IOHIDManager.h>
 #include <IOKit/hid/IOHIDUsageTables.h>
@@ -28,7 +29,32 @@
 #include "../third_party/d2r_gfx/gfx/nvn/include/totk_ui_lang.h"
 #include "../third_party/d2r_gfx/gfx/nvn/totk_shader_contrib.h"
 #include "../third_party/d2r_gfx/gfx/nvn/totk_contrib_upload.h"
-#include "auto_update.h"
+
+/* The microphone (runtime/audio_input.h; Ocarina of Time's "Ocarina Mic Input", user 2026-11-20 "只做 mac"): on when the
+   settings panel's switch wrote "1" to microphone.txt (or OOT_MIC=1). macOS asks for permission here, the first time it is
+   on, before the game starts and never during play; refused, the game starts without it (nothing is listed). */
+static void microphone_setting(NSString *data) {
+    if (!getenv("OOT_MIC")) {
+        NSString *word = [[NSString stringWithContentsOfFile:[data stringByAppendingPathComponent:@"microphone.txt"] encoding:NSUTF8StringEncoding error:nil]
+                          stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if ([word isEqualToString:@"1"]) setenv("OOT_MIC", "1", 1);
+    }
+    const char *on = getenv("OOT_MIC");
+    if (!on || strcmp(on, "1") || getenv("OOT_MIC_FILE")) return;   // the test feed needs no permission
+    AVAudioApplication *audio = AVAudioApplication.sharedInstance;
+    if (audio.recordPermission != AVAudioApplicationRecordPermissionUndetermined) {
+        if (audio.recordPermission != AVAudioApplicationRecordPermissionGranted) fprintf(stderr, "[ns2-audio] audio input: the microphone is on, but macOS access is refused (System Settings > Privacy & Security > Microphone)\n");
+        return;
+    }
+    __block int answered = 0;
+    [NSApplication sharedApplication]; [NSApp activateIgnoringOtherApps:YES];
+    [AVAudioApplication requestRecordPermissionWithCompletionHandler:^(BOOL granted) {
+        fprintf(stderr, "[ns2-audio] audio input: macOS access %s\n", granted ? "granted" : "refused");
+        answered = 1;
+    }];
+    for (NSDate *until = [NSDate dateWithTimeIntervalSinceNow:120]; !answered && until.timeIntervalSinceNow > 0;)
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+}
 
 static void show_error(NSString *detail) {
     NSAlert *alert = [NSAlert new];
@@ -140,6 +166,42 @@ static void contrib_ask(NSString *path) {
     totk_inbox_answer(path, choice == NSAlertFirstButtonReturn ? TOTK_INBOX_AUTO : TOTK_INBOX_NEVER);
 }
 
+/* 诊断模式: MNG Launcher's card switch (user 2026-11-16: "诊断模式 也改成 CheckBox， 正常启动 可以带上 诊断模式") writes "on"
+   into diagnostics.txt in the data folder, next to controls.txt (tools/builder_jobs/memory_saver.py SWITCHES); no file
+   or any other word is off. Read at every start, so it counts from the next one. */
+static BOOL diagnostics_switch(NSString *data) {
+    NSString *word = [NSString stringWithContentsOfFile:[data stringByAppendingPathComponent:@"diagnostics.txt"] encoding:NSUTF8StringEncoding error:nil];
+    return [[word stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] isEqualToString:@"on"];
+}
+
+/* Every switch of a debug session (keep/tools/oot-debug/play.sh: the game log, long-frame detail, wait statistics, the
+   per-pipeline log, the per-frame record), for a quick App (the test build, user 2026-11-15: "去掉诊断模式 快速启动 默认带诊断")
+   and for any App while 诊断模式 is on (diagnostics_switch). A choice already in the environment is kept (a test start
+   names its own record). The per-frame record goes to a run folder of this start; the newest DIAG_RUNS stay. A full App
+   with the switch off starts with none of them (the player's: user 2026-11-13). tests/test_oot_quick_start.py
+   QuickStartCarriesDiagnostics. */
+static void start_diagnostics(NSString *home, const char *why) {
+    enum { DIAG_RUNS = 5 };
+    NSString *runs = [home stringByAppendingPathComponent:@"Library/Logs/MacNativeGames/diagnostics"];
+    NSDateFormatter *stamp = [NSDateFormatter new]; stamp.dateFormat = @"yyyyMMdd-HHmmss";
+    stamp.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    NSString *run = [runs stringByAppendingPathComponent:[@"oot-" stringByAppendingString:[stamp stringFromDate:NSDate.date]]];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSArray<NSString *> *earlier = [[[fm contentsOfDirectoryAtPath:runs error:nil] ?: @[]
+        filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"SELF BEGINSWITH 'oot-'"]] sortedArrayUsingSelector:@selector(compare:)];
+    for (NSUInteger i = 0; i + DIAG_RUNS <= earlier.count; i++)   // with this one, DIAG_RUNS are left
+        [fm removeItemAtPath:[runs stringByAppendingPathComponent:earlier[i]] error:nil];
+    BOOL made = [fm createDirectoryAtPath:run withIntermediateDirectories:YES attributes:nil error:nil];
+    setenv("TOTK_DEBUG_LOG", "1", 0);
+    setenv("TOTK_LONGFRAME_DETAIL", "1", 0);
+    setenv("TOTK_SVC_STATS", "1", 0);
+    setenv("TOTK_SURVEY_SHADER_LOG", "1", 0);
+    if (made) setenv("DM_NVN_TSV", [run stringByAppendingPathComponent:@"frames.tsv"].fileSystemRepresentation, 0);
+    setenv("DM_NVN_UPTIME", "2", 0);
+    fprintf(stderr, "[launcher] %s: diagnostics on (game log, long frames, per-frame record in %s)\n", why,
+            getenv("DM_NVN_TSV") ?: "nowhere: the run folder could not be made");
+}
+
 /* The contribution file: in the project folder the app was built from, <clone>/shader-list-contribution/shader-list-contribution.txt
    (MNGContributionFolder in Info.plist, build_app.py), where players look and where the iPhone / iPad copies go too; the
    data folder when that folder is gone (user 2026-10-22: nobody found the file in ~/Library). The file that was in the data
@@ -152,8 +214,8 @@ static NSString *contrib_file(NSString *data) {
     if (![fm createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil]) return old;
     // the Mac's file (an iPhone / iPad contributes its own, totk_contrib_upload.h): the rows are the same
     // for every platform. Each game has a list of its own and so a file of its own in the folder: Tears of the Kingdom's
-    // without a suffix, Breath of the Wild's -botw, every other game's -<TOTK_GAME_DIR>, as the other games' issue form names
-    // it (.github/ISSUE_TEMPLATE/shader-list-other.yml). Ocarina of Time's used to be -botw's (user 2026-11-10: "要统一")
+    // without a suffix, Breath of the Wild's -botw, every other game's -<TOTK_GAME_DIR>.
+    // Ocarina of Time's used to be -botw's (user 2026-11-10: "要统一")
     NSString *mine = [folder stringByAppendingPathComponent:!strcmp(GAME_FOLDER, "TOTK") ? @"shader-list-contribution.txt"
                       : !strcmp(GAME_FOLDER, "BotW") ? @"shader-list-contribution-botw.txt"
                       : [NSString stringWithFormat:@"shader-list-contribution-%s.txt", TOTK_GAME_DIR]];
@@ -167,6 +229,61 @@ static NSString *contrib_file(NSString *data) {
 
 static BOOL make_dir(NSString *path) {
     return [NSFileManager.defaultManager createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
+}
+
+static BOOL path_is_inside_bundle(const char *path, const char *bundle) {
+    size_t len = strlen(bundle);
+    return !strncmp(path, bundle, len) && (!path[len] || path[len] == '/');
+}
+
+static BOOL prepare_external_save(BOOL *active, NSString **errorOut) {
+    *active = NO;
+    const char *raw = getenv("DM_SAVE");
+    if (!raw || !*raw) return YES;
+    if (raw[0] != '/') {
+        if (errorOut) *errorOut = @"DM_SAVE must be an absolute directory path.";
+        return NO;
+    }
+    char normalized[1024];
+    if (snprintf(normalized, sizeof normalized, "%s", raw) >= 1016) {
+        if (errorOut) *errorOut = @"DM_SAVE path is too long.";
+        return NO;
+    }
+    size_t len = strlen(normalized);
+    while (len > 1 && normalized[len - 1] == '/') normalized[--len] = 0;
+    for (const char *p = normalized + 1; *p;) {
+        const char *slash = strchr(p, '/');
+        size_t seg = slash ? (size_t)(slash - p) : strlen(p);
+        if (seg == 2 && p[0] == '.' && p[1] == '.') {
+            if (errorOut) *errorOut = @"DM_SAVE must not contain '..' path segments.";
+            return NO;
+        }
+        p = slash ? slash + 1 : p + seg;
+    }
+    char bundleResolved[PATH_MAX];
+    const char *bundlePath = NSBundle.mainBundle.bundlePath.fileSystemRepresentation;
+    const char *bundle = (bundlePath && realpath(bundlePath, bundleResolved)) ? bundleResolved : bundlePath;
+    if (bundle && path_is_inside_bundle(normalized, bundle)) {
+        if (errorOut) *errorOut = @"DM_SAVE must be outside the app bundle.";
+        return NO;
+    }
+    char probe[1024], resolved[PATH_MAX];
+    memcpy(probe, normalized, len + 1);
+    for (;;) {
+        if (realpath(probe, resolved)) {
+            if (bundle && path_is_inside_bundle(resolved, bundle)) {
+                if (errorOut) *errorOut = @"DM_SAVE must be outside the app bundle.";
+                return NO;
+            }
+            break;
+        }
+        char *slash = strrchr(probe, '/');
+        if (!slash || slash == probe) break;
+        *slash = 0;
+    }
+    setenv("DM_SAVE", normalized, 1);
+    *active = YES;
+    return YES;
 }
 
 /* build_app.py --mac-game-data library: the app carries no RomFS image. A folder holds it when its romfs.bin (in it, or in
@@ -224,91 +341,9 @@ static NSString *game_data_ask(NSArray<NSString *> *looked, unsigned long long s
     }
 }
 
-/* The Update page's two requests (auto_update.h), each in a cut-off copy of the launcher the game starts. */
-static NSString *update_folder(void) { return [mng_update_data() stringByAppendingPathComponent:@"update"]; }
-static NSString *update_info(NSString *key) { id v = [NSBundle.mainBundle objectForInfoDictionaryKey:key]; return [v isKindOfClass:NSString.class] ? v : nil; }
-static int update_check_run(void) {
-    if (mng_update_held() || !mng_update_data()) return 0;
-    int lock = mng_update_lock(update_folder()); if (lock < 0) return 0;
-    mng_update_check(update_folder(), update_info(@"MNGSourceRepo"), update_info(@"MNGSourceCommit"));
-    close(lock); return 0;
-}
-/* The Update button: check first, so a game is closed only for an update that can go in; then close it (as the window's
-   close does, saves written: the runtime's command file), wait for it, update with a small window saying so, and start
-   the game again. An update that cannot go in says why and how to do it by hand. */
-static void update_say(NSString *text, BOOL problem) {
-    NSAlert *alert = [NSAlert new]; alert.alertStyle = problem ? NSAlertStyleWarning : NSAlertStyleInformational;
-    alert.messageText = problem ? @(TOTK_UI("更新没有成功", "The update did not work")) : @(GAME_NAME);
-    alert.informativeText = text; [alert addButtonWithTitle:@"OK"]; [NSApp activateIgnoringOtherApps:YES]; [alert runModal];
-}
-static NSString *update_by_hand(void) {
-    NSString *repo = update_info(@"MNGSourceRepo") ?: @(TOTK_UI("你的项目文件夹", "your checkout"));
-    return [NSString stringWithFormat:@(TOTK_UI("请自己更新代码再重新编译：在 %@ 里运行 git pull，然后 python3.14 update_runtime.py \"%@\"（打不过就用 build_app.py 重新打包）。",
-                                               "Please update the code and build again yourself: run git pull in %@, then python3.14 update_runtime.py \"%@\" (or build the app again with build_app.py).")),
-            repo, NSBundle.mainBundle.bundlePath];
-}
-/* Each step of the install, in update/update.log after update_runtime.py's output. */
-static void update_note(NSString *folder, NSString *what) {
-    NSString *line = [NSString stringWithFormat:@"[update %@] %@\n", [NSDateFormatter localizedStringFromDate:NSDate.date dateStyle:NSDateFormatterNoStyle timeStyle:NSDateFormatterMediumStyle], what];
-    FILE *f = fopen([folder stringByAppendingPathComponent:@"update.log"].fileSystemRepresentation, "a"); if (f) { fputs(line.UTF8String, f); fclose(f); }
-}
-static int update_install_run(pid_t game) {
-    if (mng_update_held() || !mng_update_data()) return 0;
-    NSString *folder = update_folder();
-    int lock = mng_update_lock(folder); if (lock < 0) return 0;
-    NSString *repo = update_info(@"MNGSourceRepo"), *commit = update_info(@"MNGSourceCommit");
-    if (![mng_update_check(folder, repo, commit)[@"state"] isEqual:@"behind"]) { close(lock); return 0; }   /* the page says why */
-    NSMutableDictionary *closing = [[NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:[folder stringByAppendingPathComponent:@"status.json"]] options:0 error:nil] mutableCopy];
-    [NSFileManager.defaultManager removeItemAtPath:[folder stringByAppendingPathComponent:@"update.log"] error:nil];   /* this install's log */
-    closing[@"state"] = @"closing"; mng_update_write(folder, closing);
-    update_note(folder, [NSString stringWithFormat:@"closing the game (pid %d) to update to %@", (int)game, closing[@"to"]]);
-    const char *commands = getenv("TOTK_INPUT_FILE");
-    if (game > 0 && commands) {
-        FILE *f = fopen(commands, "a"); if (f) { fputs("close\n", f); fclose(f); }
-        int kq = kqueue(); struct kevent ev; EV_SET(&ev, game, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, NULL);
-        if (kq >= 0 && !kevent(kq, &ev, 1, NULL, 0, NULL)) while (kevent(kq, NULL, 0, &ev, 1, NULL) < 0 && errno == EINTR) {}
-        if (kq >= 0) close(kq);
-    }
-    update_note(folder, @"the game has closed; updating");
-    [NSApplication sharedApplication]; NSApp.activationPolicy = NSApplicationActivationPolicyRegular; [NSApp activateIgnoringOtherApps:YES];
-    __block NSWindow *window = nil; __block NSString *state = nil;
-    void (^installing)(NSString *, NSInteger) = ^(NSString *to, NSInteger total) {
-        window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 96) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
-        window.title = @GAME_NAME; window.releasedWhenClosed = NO;
-        NSString *what = [NSString stringWithFormat:@(TOTK_UI("正在更新到 %@（%ld 个新提交），需要几分钟，完成后自动打开游戏",
-                                                              "Updating to %@ (%ld new commits), a few minutes; the game opens when it is done")), to, (long)total];
-        NSTextField *label = [NSTextField wrappingLabelWithString:what]; label.frame = NSMakeRect(20, 42, 380, 40); [window.contentView addSubview:label];
-        NSProgressIndicator *bar = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(20, 18, 380, 16)];
-        bar.indeterminate = YES; bar.style = NSProgressIndicatorStyleBar; [window.contentView addSubview:bar]; [bar startAnimation:nil];
-        [window center]; [window makeKeyAndOrderFront:nil];
-    };
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSString *s = mng_update_install(folder, repo, NSBundle.mainBundle.bundlePath, commit, update_info(@"MNGBuildPython"), update_info(@"MNGWorkFolder"),
-                                         ^(NSString *to, NSInteger total) { dispatch_async(dispatch_get_main_queue(), ^{ installing(to, total); }); });
-        dispatch_async(dispatch_get_main_queue(), ^{ state = s; });
-    });
-    while (!state) {   /* the window drawn and macOS never seeing the launcher hang */
-        for (NSEvent *e; (e = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:[NSDate dateWithTimeIntervalSinceNow:0.1] inMode:NSDefaultRunLoopMode dequeue:YES]);) [NSApp sendEvent:e];
-    }
-    [window close];
-    close(lock);
-    update_note(folder, [@"the update ended: " stringByAppendingString:state]);
-    if (![state isEqualToString:@"updated"]) {
-        NSDictionary *d = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:[folder stringByAppendingPathComponent:@"status.json"]] options:0 error:nil];
-        NSString *why = [d[@"detail"] isKindOfClass:NSString.class] && [d[@"detail"] length] ? d[@"detail"] : @"";
-        update_say([NSString stringWithFormat:@"%@%@%@", why, why.length ? @"\n\n" : @"", update_by_hand()], YES);
-    }
-    NSTask *open = [NSTask new]; open.executableURL = [NSURL fileURLWithPath:@"/usr/bin/open"];   /* -n: this launcher is the app too */
-    open.arguments = @[@"-n", NSBundle.mainBundle.bundlePath]; BOOL opened = [open launchAndReturnError:nil]; [open waitUntilExit];
-    update_note(folder, [NSString stringWithFormat:@"opening the game again: %@", opened && !open.terminationStatus ? @"done" : @"failed"]);
-    return 0;
-}
-
 /* Returns -1 with *boot set to the arguments the game boots with (rewritten folder, "boot"), or the status to exit with. */
 int runtime_app_launch(int argc, char **argv, char ***boot) {
     @autoreleasepool {
-        if (argc > 1 && !strcmp(argv[1], "--update-check")) return update_check_run();   // the Update page (auto_update.h)
-        if (argc > 2 && !strcmp(argv[1], "--update-install")) return update_install_run((pid_t)atoi(argv[2]));
         NSString *root = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"totk"];
         NSString *binary = [root stringByAppendingPathComponent:@"rewritten/" TOTK_GAME_DIR "/main.patched.bin"];   // the game's code
         /* --check (build_app.py, once after packaging): only look that the game is there and exit. The first run of a new
@@ -334,8 +369,9 @@ int runtime_app_launch(int argc, char **argv, char ***boot) {
             const char *v = getenv(name); return v && *v ? @(v) : fallback; };
         NSString *profile = env_or("TOTK_PROFILE_DIR", [data stringByAppendingPathComponent:@"profile"]);
         NSString *slot = env_or("TOTK_GAME_SLOT_DIR", [home stringByAppendingPathComponent:@"Library/Application Support/MacNativeGames/TOTK/game-slot"]);
-        /* One cache per prepared seed, as totk_shader_rt.m totk_rt_dir names it: a cache's own variants come before the seed's
-           (variants_of), so variants left by an earlier build of the same chain would hide the seed's and miss its pipeline archive. */
+        /* One cache per prepared seed, as totk_shader_rt.m totk_rt_dir names it: its translations are another translator's
+           otherwise. (Until 61e7c86d the cache's variants also came before the seed's.) The pipeline archive and the
+           collected list are not lost with the folder: a new one takes them over (totk_rt_carry.h, 2026-11-16). */
         NSString *cacheChain = @DMSH_CHAIN;
         NSData *seedManifest = [NSData dataWithContentsOfFile:[root stringByAppendingPathComponent:@"build/shader-seed/seed-manifest.json"]];
         NSDictionary *seedMetadata = seedManifest ? [NSJSONSerialization JSONObjectWithData:seedManifest options:0 error:nil] : nil;
@@ -367,6 +403,12 @@ int runtime_app_launch(int argc, char **argv, char ***boot) {
             }
         }
 #endif
+        BOOL hasExternalSave = NO;
+        NSString *saveError = nil;
+        if (!prepare_external_save(&hasExternalSave, &saveError)) {
+            show_error(saveError);
+            return 1;
+        }
         if (chdir(root.fileSystemRepresentation) != 0) {   // the game reads its data relative to this folder
             show_error(@"Cannot open the game folder inside the app.");
             return 1;
@@ -383,6 +425,7 @@ int runtime_app_launch(int argc, char **argv, char ***boot) {
             if (line) { show_error([NSString stringWithFormat:@"%@, line %d: %s", controls, line, problem]); return 1; }
         }
         setenv("TOTK_CONTROLS", controls.fileSystemRepresentation, 1);
+        microphone_setting(data);
         /* key 3's picture mode, kept between runs (runtime/game_patches_v143.c picture_mode_save / _restore) */
         setenv("TOTK_PICTURE_MODE", env_or("TOTK_PICTURE_MODE", [data stringByAppendingPathComponent:@"picture-mode.txt"]).fileSystemRepresentation, 1);
         setenv("TOTK_PROFILE_DIR", profile.fileSystemRepresentation, 1);
@@ -420,10 +463,12 @@ int runtime_app_launch(int argc, char **argv, char ***boot) {
         setenv("TOTK_NATIVE_DIR", [root stringByAppendingPathComponent:@"build"].fileSystemRepresentation, 1);
         /* Save sync (runtime/cloud_save.m): the folder the player chose in the app menu (runtime/frontend.m) or in
            cloud_folder_offer, which asks at a start that has none. TOTK_CLOUD_SAVE_DIR wins over it; 0 = off. */
-        NSUserDefaults *sync = [[NSUserDefaults alloc] initWithSuiteName:@RUNTIME_SAVE_SYNC_DEFAULTS];
-        NSString *chosen = [sync stringForKey:@"TOTK_CLOUD_SAVE_FOLDER"];
-        if (!getenv("TOTK_CLOUD_SAVE_DIR") && !getenv("TOTK_CLOUD_SAVE_FOLDER") && !chosen.length) chosen = cloud_folder_offer(sync);
-        if (!getenv("TOTK_CLOUD_SAVE_DIR") && chosen.length) setenv("TOTK_CLOUD_SAVE_FOLDER", chosen.fileSystemRepresentation, 0);
+        if (!hasExternalSave) {
+            NSUserDefaults *sync = [[NSUserDefaults alloc] initWithSuiteName:@RUNTIME_SAVE_SYNC_DEFAULTS];
+            NSString *chosen = [sync stringForKey:@"TOTK_CLOUD_SAVE_FOLDER"];
+            if (!getenv("TOTK_CLOUD_SAVE_DIR") && !getenv("TOTK_CLOUD_SAVE_FOLDER") && !chosen.length) chosen = cloud_folder_offer(sync);
+            if (!getenv("TOTK_CLOUD_SAVE_DIR") && chosen.length) setenv("TOTK_CLOUD_SAVE_FOLDER", chosen.fileSystemRepresentation, 0);
+        }
         /* Player mods (runtime/romfs.c): <data>/mods/<version>/manifest.tsv, when present. With no controller connected at
            start, <data>/mods/<version>-keyboard takes its place when it holds a manifest (keyboard key icons in the prompts:
            scripts/make_button_icons.py --style keyboard or azerty). The fonts are read once, so it holds for the session. */
@@ -446,14 +491,33 @@ int runtime_app_launch(int argc, char **argv, char ***boot) {
         /* The commit the app was built from (build_app.py MNGSourceCommit): the HUD box shows it (runtime/frontend.m). */
         NSString *commit = [NSBundle.mainBundle objectForInfoDictionaryKey:@"MNGSourceCommit"];
         if ([commit isKindOfClass:NSString.class] && commit.length) setenv("TOTK_SOURCE_COMMIT", commit.UTF8String, 1);
-        NSString *contrib = env_or("TOTK_SHADER_CONTRIB", contrib_file(data));
-        setenv("TOTK_SHADER_CONTRIB", contrib.fileSystemRepresentation, 1);
-        { const char *seed = getenv("TOTK_SHADER_SEED_DIR");   // what this app serves leaves the file before the reminder counts it
-          NSString *build = [root stringByAppendingPathComponent:@"build"];
-          totk_contrib_prune(contrib, seed ? @(seed) : [build stringByAppendingPathComponent:@"shader-seed"], build); }
-        contrib_ask(contrib);
-        totk_inbox_start(contrib, @"mac");   // the player chose "Contribute shaders": sent while playing
-        setenv("TOTK_BOARD_DIR", data.fileSystemRepresentation, 0);   // the leaderboard's folder (runtime/board_upload.h); a test run keeps its own
+        /* The MNG Launcher that built or last updated the app (build_app.py MNGLauncherVersion): before the commit in the
+           HUD box's build line (shared/runtime/hud_box.h hud_build_text). */
+        NSString *builder = [NSBundle.mainBundle objectForInfoDictionaryKey:@"MNGLauncherVersion"];
+        if ([builder isKindOfClass:NSString.class] && builder.length) setenv("TOTK_LAUNCHER_VERSION", builder.UTF8String, 1);
+        /* A quick App (games/oot/build.py shader_mode 'title', MNGShaders) contributes nothing: its warm-up lists hold only
+           the title's rows, so every pipeline it met would look new and go to the inbox (2026-11-13: one session of the
+           quick copy wrote 165 of the list's own pipelines and 120 of its variants), as a run without the seed would
+           (totk_contrib_path). Once filled in (MNG Launcher's 补全着色器: MNGShaders 'full') it contributes again. */
+        NSString *shaders = [NSBundle.mainBundle objectForInfoDictionaryKey:@"MNGShaders"];
+        BOOL quick = [shaders isKindOfClass:NSString.class] && [shaders isEqualToString:@"title"];
+        setenv("TOTK_BOARD_DIR", data.fileSystemRepresentation, 0);   // the leaderboard's folder (runtime/board_upload.h); a test run keeps its own;
+        //   named first: the uploads below send the board's id with the rows (totk_inbox_board_id)
+        // a quick App always, any App while 诊断模式 is on (MNG Launcher's card switch, diagnostics.txt)
+        if (quick) start_diagnostics(home, "quick App");
+        else if (diagnostics_switch(data)) start_diagnostics(home, "诊断模式 (diagnostics.txt)");
+        if (quick) {
+            unsetenv("TOTK_SHADER_CONTRIB");
+            fprintf(stderr, "[launcher] quick App (only the title's shaders): no shader contribution until it is filled in\n");
+        } else {
+            NSString *contrib = totk_inbox_claim(env_or("TOTK_SHADER_CONTRIB", contrib_file(data)));   // this game's file only
+            setenv("TOTK_SHADER_CONTRIB", contrib.fileSystemRepresentation, 1);
+            { const char *seed = getenv("TOTK_SHADER_SEED_DIR");   // what this app serves leaves the file before the reminder counts it
+              NSString *build = [root stringByAppendingPathComponent:@"build"];
+              totk_contrib_prune(contrib, seed ? @(seed) : [build stringByAppendingPathComponent:@"shader-seed"], build); }
+            contrib_ask(contrib);
+            totk_inbox_start(contrib, @"mac");   // the player chose "Contribute shaders": sent while playing
+        }
         unsetenv("TOTK_AUTOLOAD");   // the game starts at its title screen, as on the console
         /* runtime command channel (runtime/input.c): echo "shot ~/Desktop/shot.png" >> "<data>/input.txt" */
         { NSString *cmds = env_or("TOTK_INPUT_FILE", [data stringByAppendingPathComponent:@"input.txt"]);
@@ -485,6 +549,8 @@ int runtime_app_launch(int argc, char **argv, char ***boot) {
         const char *debugEnv = getenv("TOTK_DEBUG_LOG");
         BOOL debugLog = debugEnv ? (*debugEnv && strcmp(debugEnv, "0")) : [NSUserDefaults.standardUserDefaults boolForKey:@"TOTK_DEBUG_LOG"];
         NSString *log = [logs stringByAppendingPathComponent:@GAME_LOG ".log"];
+        // Failure-only evidence survives even when normal debug output is off (#2112).
+        setenv("OOT_GPU_ERROR_LOG", [logs stringByAppendingPathComponent:@GAME_LOG ".gpu-error.log"].fileSystemRepresentation, 0);
         NSString *previous = [logs stringByAppendingPathComponent:@GAME_LOG ".previous.log"];
         [NSFileManager.defaultManager removeItemAtPath:previous error:nil];
         if (debugLog) [NSFileManager.defaultManager moveItemAtPath:log toPath:previous error:nil];
@@ -495,7 +561,6 @@ int runtime_app_launch(int argc, char **argv, char ***boot) {
             dup2(fileno(lf), STDERR_FILENO);
             fclose(lf);
         }
-        setenv("TOTK_UPDATE_LAUNCHER", NSBundle.mainBundle.executablePath.fileSystemRepresentation, 1);
         static char *arguments[4] = {NULL, "rewritten/" TOTK_GAME_DIR, "boot", NULL};
         arguments[0] = argv[0];
         *boot = arguments;

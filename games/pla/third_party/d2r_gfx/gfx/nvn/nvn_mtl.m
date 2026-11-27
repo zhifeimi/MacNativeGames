@@ -2426,6 +2426,7 @@ static int diag_shader_prefix_matches(const char *key, uint64_t value) {
     return key && !strncmp(key, prefix, 16);
 }
 void dm_gfx_set_flag(const char *name, int v) {
+    if (!strcmp(name, "link_pause")) { void mtl_link_pause(int on); mtl_link_pause(v); MLOG("[flag] link_pause = %d (the display link stops calling back, as when the system stalls it)", v != 0); return; }   // tests the display-link rescue
     if (!strcmp(name, "arg_epoch")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_on, v != 0); MLOG("[flag] arg_epoch = %d", v != 0); return; }
     if (!strcmp(name, "arg_epoch_check")) { (void)arg_epoch_on(); atomic_store(&g_arg_epoch_check, v != 0); MLOG("[flag] arg_epoch_check = %d verified=%llu extra=%llu", v != 0, (unsigned long long)atomic_load(&g_arg_epoch_verified), (unsigned long long)atomic_load(&g_arg_epoch_extra)); return; }
     if (!strcmp(name, "tex_slots")) { (void)tex_slots_on(); atomic_store(&g_tex_slots_on, v != 0); MLOG("[flag] tex_slots = %d", v != 0); return; }
@@ -5056,6 +5057,7 @@ static NSString *msl_init_vertex_outputs(NSString *src) {
     if (!init.length) return src;
     NSRange stmt = [src rangeOfString:@"main0_out out = {};" options:0 range:NSMakeRange(close.location, src.length - close.location)];
     if (stmt.location == NSNotFound) return src;
+    if ([src rangeOfString:[@"main0_out out = {};" stringByAppendingString:init]].location != NSNotFound) return src;   // already seeded (the iPhone's sources, msl_rewrite_tool)
     NSMutableString *out = [src mutableCopy];
     [out insertString:init atIndex:stmt.location + stmt.length];
     return out;
@@ -5079,6 +5081,36 @@ static NSString *msl_dual_source(NSString *src) {
     [out replaceCharactersInRange:c1 withString:@"[[color(0), index(1)]]"];
     return out;
 }
+#if !TARGET_OS_IPHONE
+/* `<host> <rewritten> msl-rewrite <folder>` (Mac; the iPhone build, games/pla/ios/tools/build_ipa.py): the source fixes
+   shader_load makes before it compiles a translation (msl_init_vertex_outputs for vertex shaders, msl_zero_unwritten_colors
+   for fragment shaders), written into every <variant>_b.metal of the folder whose _b.json names that stage. The iPhone
+   loads libraries compiled from the seed's sources on the Mac (games/totk/ios/tools/compile_seed.py) and cannot change a
+   compiled library, so its sources carry the fixes first: the device draws what the Mac draws. Both fixes leave a source
+   they already changed as it is (or only seed what is already seeded). Prints the count; exit 1 when a file cannot be
+   written. Runs no game code. */
+int mtl_msl_rewrite_tool(const char *folder) {
+    NSFileManager *fm = NSFileManager.defaultManager; unsigned seen = 0, changed = 0;
+    for (NSString *name in [[fm contentsOfDirectoryAtPath:@(folder) error:nil] sortedArrayUsingSelector:@selector(compare:)]) @autoreleasepool {
+        if (![name hasSuffix:@"_b.metal"]) continue;
+        NSString *path = [@(folder) stringByAppendingPathComponent:name];
+        NSData *jd = [NSData dataWithContentsOfFile:[[path stringByDeletingPathExtension] stringByAppendingPathExtension:@"json"]];
+        NSDictionary *j = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
+        NSString *stage = [j isKindOfClass:NSDictionary.class] ? j[@"stage"] : nil;
+        if (![stage isEqual:@"vs"] && ![stage isEqual:@"ps"]) continue;
+        NSString *src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+        if (!src) continue;
+        seen++;
+        NSString *out = [stage isEqual:@"vs"] ? msl_init_vertex_outputs(src) : msl_zero_unwritten_colors(src);
+        if ([out isEqualToString:src]) continue;
+        [fm removeItemAtPath:path error:nil];   // a clone of the seed's file: replaced, never written through
+        if (![out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) { fprintf(stderr, "msl-rewrite: cannot write %s\n", path.UTF8String); return 1; }
+        changed++;
+    }
+    printf("{\"shaders\": %u, \"changed\": %u}\n", seen, changed);
+    return 0;
+}
+#endif
 static id<MTLLibrary> totk_msl_library(NSString *src, NSError **err) {
     NSError *e = nil;
     for (int attempt = 1;; attempt++) {
@@ -5175,6 +5207,16 @@ static id<MTLLibrary> shader_lib_prebuilt(NSData *src) {
     return lib;
 }
 #endif
+/* The seed's libraries are the device's (iOS; on the Mac TOTK_SHADER_DEVICE_LIBS=1, the iPhone packaging's archive mode), as Tears of
+   the Kingdom's and Super Mario Odyssey's shader_device_libs. */
+static int shader_device_libs(void) {
+#if TARGET_OS_IPHONE
+    return 1;
+#else
+    static int on = -1; if (on < 0) { const char *dl = getenv("TOTK_SHADER_DEVICE_LIBS"); on = dl && !strcmp(dl, "1"); }
+    return on;
+#endif
+}
 static NvShader *shader_load(NSString *pc, int stage) {
     NSError *e = nil;
     // TOTK: runtime translations are MSL source compiled here (macOS allows runtime compilation); the OS caches compiled code.
@@ -5183,11 +5225,18 @@ static NvShader *shader_load(NSString *pc, int stage) {
     NSString *lp = [NSString stringWithFormat:@"%@/%@.metallib", g_msl_dir, pc];
     id<MTLLibrary> lib = nil;
     if (rt) {
-#if TARGET_OS_IPHONE
-        // iOS: the variant precompiled on the Mac (ios/tools/build_metallibs.sh, same options) if it came in shaders.pack
+#if !TARGET_OS_IPHONE
+        /* TOTK_SHADER_DEVICE_LIBS=1 (Mac, the iPhone packaging's archive mode): the seed's device libraries the way iOS loads them, so
+           the pipelines made here describe the very libraries an iPhone loads (as Tears of the Kingdom's shader_load_mode). The
+           device libraries are compiled from sources the iPhone build already passed through msl_rewrite_tool (below), so they
+           carry this file's PLA source fixes. */
+        if (shader_device_libs())
+#endif
+        {
+        // iOS: the variant precompiled on the Mac (games/totk/ios/tools/compile_seed.py, same options), in the seed
         NSString *rt_lib = [NSString stringWithFormat:@"%@/%@.metallib", totk_rt_dir(), pc];
         if ([NSFileManager.defaultManager fileExistsAtPath:rt_lib]) { lib = lib_from_file(rt_lib, &e); if (!lib) MLOG("【红】预编译着色器库加载失败 %s：%s（改为现编）", pc.UTF8String, e.localizedDescription.UTF8String); else atomic_fetch_add(&g_rt_prebuilt, 1); }
-#endif
+        }
         if (!lib) { NSData *raw = [NSData dataWithContentsOfFile:rt_src options:0 error:&e];
 #if !TARGET_OS_IPHONE
                     if (raw && (lib = shader_lib_prebuilt(raw))) atomic_fetch_add(&g_rt_prebuilt, 1);
@@ -6403,6 +6452,8 @@ static int pso_dual_needed(const pso_key *k, NvShader *fs, int merged) {
     const blend_st *b = &k->blend[0];
     return bfac_src1(b->src_rgb) || bfac_src1(b->dst_rgb) || bfac_src1(b->src_a) || bfac_src1(b->dst_a);
 }
+#include "dm_signpost.h"                  /* DM_SP_BEGIN / DM_SP_END in the archive's pso_new / cs_new (shared) */
+#include "totk_pipeline_archive_port.h"   /* Tears of the Kingdom's pipeline archive (shared, as Animal Crossing's and Super Mario Odyssey's): pso_new, cs_new, the archive keys */
 static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = vs_fn_for(vs, fs, (k->a2c & PSO_LAYERED) != 0, (k->a2c & PSO_VBORDER) != 0); d.fragmentFunction = fsfn ? fsfn : fs ? (k->dfmt ? fs->fn : fs_fn_without_depth(fs)) : nil;
@@ -6567,9 +6618,9 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
     if (at < 0 && slot < 0) g_pp_full++;
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
-    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
+    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++; NSString *key = pso_archive_key(k, vs, fs, 0);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+        NSError *e = nil; id<MTLRenderPipelineState> ps = pso_new(d, key, &e);
         pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
     });
 }
@@ -6608,13 +6659,13 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     else {
         if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, bfn ? bfn : g_pso_fsfn, g_pso_lmap != NULL);
-        ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+        ps = pso_new(d, pso_archive_key(&k, vs, fs, g_pso_lmap != NULL), &e);
         /* PLA: NVN tolerates a pass that blends attachments the fragment shader never writes; Metal rejects
            the pipeline ("...that is required for blending"). Retry with those attachments blended off and
            masked out, which is what the hardware effectively draws. */
         if (!ps) {   /* PLA: with MTL_ERROR_MODE=ignore Metal returns nil without an NSError, so retry blind */
             for (int i = 1; i < 8; i++) { d.colorAttachments[i].blendingEnabled = NO; d.colorAttachments[i].writeMask = MTLColorWriteMaskNone; }   /* every extra attachment, set or not */
-            e = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+            e = nil; ps = pso_new(d, nil, &e);   /* not archived: its descriptor is not the one its key names */
             { static int said; if (!said++) MLOG("[pla] pipeline retry without extra color attachments -> %s", ps ? "ok" : "still nil"); }
         }
     }
@@ -6766,6 +6817,7 @@ static void warm_enqueue(WarmItem *item) {
     atomic_store_explicit(&g_warm_ready, 1, memory_order_release);
     os_unfair_lock_unlock(&g_warm_lock);
 }
+static int g_warm_pipelines_only;   // a pipeline archive is used: the lists' S rows (shader libraries alone) are skipped (warm_start)
 /* Count the exact manifest rows and cached variants this run will visit before
    displaying a determinate bar. Shader/PSO counts are separate: one pipeline
    row may load two shaders, and a failed row still advances the task bar. */
@@ -6781,7 +6833,7 @@ static void warm_plan(NSArray<NSString *> *paths, NSArray<NSString *> *files, NS
             [rows addObject:line];
             NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
             if ([c[0] isEqualToString:@"S"] && c.count >= 3 && [c[1] length]) {
-                if (!warm_available(c[1])) continue;
+                if (g_warm_pipelines_only || !warm_available(c[1])) continue;
                 [keys addObject:c[1]];
             }
             else if ([c[0] isEqualToString:@"R"] && c.count >= 2) {
@@ -6821,6 +6873,11 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
         NSMutableSet<NSString *> *seen = [NSMutableSet set];
         NSUInteger path_index = 0;
         MLOG("后台预热：着色器库用 %d 个线程编（TOTK_WARM_THREADS），进世界后最多 2 个", warm_threads());
+        /* A pipeline the archive lacks (one met in play last time, from the device's list) goes into it as soon as this
+           compiled it, so the next start takes it from there (totk_pipeline_archive.h par_add), as Tears of the Kingdom's
+           and Super Mario Odyssey's warm_worker. The pipelines built in play are not written; the lists have them for the
+           next warm-up. */
+        par_write_in_place = 1;
         uint64_t done = 0;
         for (NSString *path in paths) {
             NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
@@ -6855,7 +6912,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                         }
                         pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fsfn;
                         NSError *e = nil; uint64_t ps_started = bp_now();
-                        id ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, fsfn, sk.merged) error:&e];
+                        id ps = pso_new(pso_desc(&k, vs, fs, fsfn, sk.merged), pso_archive_key(&k, vs, fs, sk.merged), &e);
                         atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - ps_started); atomic_fetch_add(&g_warm_pipeline_count, 1);
                         if (!ps) { MLOG("【红】后台建渲染管线失败：%s", e.localizedDescription.UTF8String); warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                         WarmItem *item = [WarmItem new]; item->kind = 1; item->vs_key = vkey; item->fs_key = fkey; item->vs = vs; item->fs = fs; item->fsfn = fsfn; item->pso = k; item->object = ps;
@@ -6864,7 +6921,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                         NSString *key = c[1]; if (!key.length) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                         NvShader *cs = warm_shader(dict, key, 5);
                         if (!cs) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
-                        NSError *e = nil; uint64_t ps_started = bp_now(); id ps = [g_dev newComputePipelineStateWithFunction:cs->fn error:&e];
+                        NSError *e = nil; uint64_t ps_started = bp_now(); id ps = cs_new(cs, &e);
                         atomic_fetch_add(&g_warm_pipeline_ns, bp_now() - ps_started); atomic_fetch_add(&g_warm_pipeline_count, 1);
                         if (!ps) { MLOG("【红】后台建计算管线失败：%s", e.localizedDescription.UTF8String); warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                         WarmItem *item = [WarmItem new]; item->kind = 2; item->key = key; item->shader = cs; item->object = ps;
@@ -6883,7 +6940,9 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
         // extend the measured total rather than being silently omitted.
         NSMutableArray<NSString *> *cache_files = [files mutableCopy];
         NSMutableSet<NSString *> *known_files = [NSMutableSet setWithArray:files];
-        NSArray<NSString *> *latest = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:rt error:nil] sortedArrayUsingSelector:@selector(compare:)];
+        par_flush_thread(); par_pre_check();   // the lists' pipelines written; the app's Mac-built ones this Metal refuses are dropped
+        NSArray<NSString *> *latest = g_par_valid ? @[] :   // with a pipeline archive the rest is made when first drawn
+            [[NSFileManager.defaultManager contentsOfDirectoryAtPath:rt error:nil] sortedArrayUsingSelector:@selector(compare:)];
         for (NSString *file in latest) if ([file hasSuffix:@"_b.metal"] && ![known_files containsObject:file]) {
             // The native service publishes reflection last. A newly written
             // MSL with no reflection yet is still in flight, not a failed shader.
@@ -6929,6 +6988,7 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
              (unsigned long long)atomic_load(&g_warm_library_count),atomic_load(&g_warm_library_ns)/1e6,
              (unsigned long long)atomic_load(&g_warm_pipeline_count),atomic_load(&g_warm_pipeline_ns)/1e6);
     }
+    par_flush_thread(); par_write_in_place = 0;   // a queue thread: other work may run on it next
     atomic_store(&g_warm_running, 0);
     if (runtime_warm_done) runtime_warm_done();
 }
@@ -7007,10 +7067,10 @@ static void warm_light(void) {
                 NvShader *vs = vkey.length ? warm_shader(dict, vkey, sk.vs_stage) : nil, *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
                 if (!vs || (fkey.length && !fs)) { nfail++; continue; }
                 pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = NULL;
-                NSError *er = nil; ps = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&k, vs, fs, nil, sk.merged) error:&er]; tried = 1; nr += ps != nil;
+                NSError *er = nil; ps = pso_new(pso_desc(&k, vs, fs, nil, sk.merged), pso_archive_key(&k, vs, fs, sk.merged), &er); tried = 1; nr += ps != nil;
             } else if ([c[0] isEqualToString:@"C"] && c.count >= 2 && [c[1] length]) {
                 NvShader *cs = warm_shader(dict, c[1], 5); if (!cs) { nfail++; continue; }
-                NSError *er = nil; ps = [g_dev newComputePipelineStateWithFunction:cs->fn error:&er]; tried = 1; nc += ps != nil;
+                NSError *er = nil; ps = cs_new(cs, &er); tried = 1; nc += ps != nil;
             }
             if (tried && !ps) nfail++;
             if (tried && bp_now() - t1 > 20000000ull) slow++;   // > 20 ms: compiled, not a cache hit
@@ -7021,6 +7081,7 @@ static void warm_light(void) {
     });
 #endif
 }
+#include "totk_pipeline_archive_port_fill.h"   /* the iPhone packaging's mode: the lists' pipelines into the archive (mtl_pipeline_archive_tool) */
 static void warm_start(void) {
     if (g_warm_started++) return;
     warm_filled();
@@ -7058,7 +7119,15 @@ static void warm_start(void) {
         MLOG("预热清单（自动着色器收集）：%s；另加翻译缓存里的全部着色器", desc.UTF8String);
     }
     if (!g_warm_items) g_warm_items = [NSMutableArray array];
-    NSArray<NSString *> *files = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:totk_rt_dir() error:nil] sortedArrayUsingSelector:@selector(compare:)] ?: @[];
+    /* The pipeline archive (totk_pipeline_archive.h; on the device the Mac's files for its GPU, par_load_prebuilt): with
+       valid files the lists' pipelines are made from them, and the rest when first drawn. Skipped then, as Tears of the
+       Kingdom's and Super Mario Odyssey's warm_start: the shader libraries alone, every S row of the lists and every
+       other shader of the cache. */
+    par_open_dir(g_dev);
+    g_warm_pipelines_only = g_par_valid;
+    if (g_par_valid) MLOG("预热：有管线存档，只建管线清单里的管线（不单独加载着色器库），其余用到时从存档取");
+    NSArray<NSString *> *files = g_par_valid ? @[] :
+        [[NSFileManager.defaultManager contentsOfDirectoryAtPath:totk_rt_dir() error:nil] sortedArrayUsingSelector:@selector(compare:)] ?: @[];
     uint64_t total = 0, shader_total = 0, pipeline_total = 0;
     NSMutableSet<NSString *> *planned_keys = [NSMutableSet set];
     NSMutableSet<NSString *> *eligible = [NSMutableSet set];
@@ -11081,7 +11150,7 @@ static void dispatch(const p_dispatch *dp) {
     const void *k = (__bridge const void *)cs;
     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
     if (!ps) {
-        NSError *e = nil; uint64_t bt = bp_now(); ps = [g_dev newComputePipelineStateWithFunction:cs->fn error:&e];
+        NSError *e = nil; uint64_t bt = bp_now(); ps = cs_new(cs, &e);
         g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
         if (!ps) { MLOG("【红】建计算管线失败：%s", e.localizedDescription.UTF8String); return; }
         if (survey_shader_log()) MLOG("[survey-shader] frame %llu compute pipeline %s in %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), cs->key, (bp_now() - bt) / 1e6);
@@ -13081,6 +13150,14 @@ static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], 
 #define STALL_NS 100000000ull
 #define STALL_RED_NS 2000000000ull
 static uint64_t g_stall_t0, g_stall_drop, g_stall_n; static int g_stall_red, g_stall_logged;
+/* The display link's rescue, as games/totk's (cf1e6298, from D2R Mobile afad65c): when the display link stays silent for
+   LINK_RESCUE_NS while the app is active, stop waiting for it: switch to mode 0 (the present thread takes drawables
+   itself), so the picture keeps moving. After g_rescue_back_ns the display link is tried again (link_sync); a new stall
+   doubles the interval, up to 60 s. Upstream saw an iPhone's display link stop while active and never come back: the
+   drop fallback alone froze the picture for 80 s. Changed under g_pq_mu; the mode switch itself is link_sync's, on the
+   present thread. */
+#define LINK_RESCUE_NS 500000000ull
+static int g_rescue_mode; static uint64_t g_rescue_back_at, g_rescue_back_ns = 3000000000ull, g_rescue_n;
 // 显示节拍看门狗只认「激活」状态：App 失去活跃（下拉控制中心 / 通知、来电、系统弹窗）和后台里系统本来就不回调，画面也被盖住——丢帧兜底照旧，
 // 但不算卡住、不报红；停顿从「最近一次回调 / 最近一次激活」较晚的那个算起（A16 日志：失活 8–17 秒、后台 17 秒都被报成「前台卡住」）
 // The display link watchdog only recognizes the "active" state: when the App loses active status (pulling down Control Center / notifications, incoming call, system popup) and in the background the system does not call back anyway, and the picture is covered too -- the frame-drop fallback stays as before,
@@ -13168,6 +13245,9 @@ static void *link_main(void *arg) {   // 显示节拍线程：切到节拍模式
 static _Atomic int g_link_fallback; static _Atomic uint64_t g_link_fallback_at;
 static int link_fallback_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_PRESENT_LINK_FALLBACK"); on = e && !strcmp(e, "1"); } return on; }
 static void link_sync(void) {   // 游戏出图线程每帧调：把节拍对象的状态对齐到 g_dm_present_link 与省电模式（运行中可改） | Called every frame by the game's present thread: aligns the display link object's state to g_dm_present_link and the power-saving mode (can change at run time)
+    if (g_rescue_mode && now_ns() >= g_rescue_back_at) {   // rescue period over: back to the display link (stall timing starts afresh)
+        pthread_mutex_lock(&g_pq_mu); g_dm_present_link = g_rescue_mode; g_rescue_mode = 0; g_stall_t0 = 0; g_link_tick_ns = now_ns(); pthread_mutex_unlock(&g_pq_mu);
+        MLOG("显示节拍：抢救期满，换回节拍模式 %d 再试（帧 %llu）", g_dm_present_link, (unsigned long long)atomic_load(&g_cur_frame)); }
     static int applied; int want = g_dm_present_link;
     if (want < 0 || want > 2) { g_dm_present_link = applied == 3 ? 1 : applied; return; }
     if (want && atomic_load(&g_link_fallback)) {
@@ -13375,6 +13455,11 @@ void mtl_present_wait(uint64_t tk) {
             MLOG("[present] display link silent while active: presenting in classic mode (DM_PRESENT_LINK_FALLBACK)"); }
         if (active && !g_stall_logged && now - from >= STALL_NS) { g_stall_logged = 1;
             MLOG("显示节拍 %.0f ms 没回调（激活中，%s）：丢掉排队未上屏的 %llu 帧，游戏继续（第 %llu 段；节拍回来自动照常）", (now - from) / 1e6, window_seen(), (unsigned long long)n, (unsigned long long)g_stall_n); }
+        if (active && !g_rescue_mode && g_dm_present_link && now - from >= LINK_RESCUE_NS) {
+            g_rescue_mode = g_dm_present_link; g_dm_present_link = 0; g_rescue_n++; g_rescue_back_at = now + g_rescue_back_ns;
+            MLOG("显示节拍激活中停了 %.0f ms（%s）：改为自己取 drawable 出图（第 %llu 次），%.0f 秒后再换回节拍试", (now - from) / 1e6, window_seen(), (unsigned long long)g_rescue_n, g_rescue_back_ns / 1e9);
+            if (g_rescue_back_ns < 60000000000ull) g_rescue_back_ns *= 2;
+        }
         if (active && !g_stall_red && now - from >= STALL_RED_NS) { g_stall_red = 1; MLOG("【红】显示节拍激活中连续 %.1f 秒没回调，出图全靠兜底丢帧，画面不动（%s）", (now - from) / 1e9, window_seen()); }
     }
     pthread_mutex_unlock(&g_pq_mu);

@@ -6,6 +6,11 @@
 #   make runtime   # build/mvdk-native, from the tables of scripts/prepare_runtime.py and the RomFS / font configs
 #   make boot      # run it from this folder
 # GAME_WONDER is defined too: the host's Wonder paths (offline services, 60 Hz VI vsync) apply to this game as well.
+# opus and libvpx come from the repository's tools/deps: made once per Mac from pinned sources (no Homebrew).
+# make runs here (games/<game>); set a *_PREFIX to use another build.
+OPUS_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix opus),$(error tools/deps could not make opus))
+VPX_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix libvpx),$(error tools/deps could not make libvpx))
+
 VERSION ?= mvdk101
 
 GFX_SRC := $(wildcard third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nvn/*.m third_party/d2r_gfx/gfx/nvn/*.S third_party/d2r_gfx/gfx/tex/*.c third_party/d2r_gfx/gfx/tex/*.m)
@@ -32,8 +37,12 @@ build/$(VERSION)/romfs_config.h: scripts/prepare_romfs_backend.py extracted/$(VE
 build/shared_fonts_config.h: scripts/prepare_shared_fonts.py extracted/firmware/shared-fonts/manifest.json
 	"$(PY)" scripts/prepare_shared_fonts.py
 
+# The game binary runs on macOS 26 whatever SDK builds it: with no minimum, clang and ld take the SDK's version (Launcher
+# 1.1.5, made on macOS 27, carried runtimes of minos 27.2 that macOS 26 refused, #2395). Set only on this target (make passes it
+# to what it is made of): the translator and spirv-cross targets keep their own flags.
+$(BINARY): export MACOSX_DEPLOYMENT_TARGET := 26.0
 $(BINARY): $(RUNTIME_SRC) $(RUNTIME_HEADERS) build/$(VERSION)/runtime_tables.h build/$(VERSION)/romfs_config.h build/shared_fonts_config.h $(GFX_OBJECTS) Makefile
-	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DGAME_MVDK=1 -DGAME_WONDER=1 $(VERSION_FLAGS) -Iruntime -Ibuild/$(VERSION) -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include $(RUNTIME_SRC) $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
+	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DGAME_MVDK=1 -DGAME_WONDER=1 $(VERSION_FLAGS) -Iruntime -Ibuild/$(VERSION) -Ibuild -I$(OPUS_PREFIX)/include/opus -I$(VPX_PREFIX)/include $(RUNTIME_SRC) $(GFX_OBJECTS) $(OPUS_PREFIX)/lib/libopus.a $(VPX_PREFIX)/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
 runtime: $(BINARY)
 
 boot: runtime

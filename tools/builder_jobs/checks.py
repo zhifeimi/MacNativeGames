@@ -12,8 +12,8 @@ import sys
 
 from tools.builder_jobs.text import t
 
-BREW = Path('/opt/homebrew')
-BREW_PACKAGES = ('opus', 'libvpx')      # build_app.py prerequisites(): linked into the runtime
+# No game's build takes a library or tool from Homebrew: opus, libvpx and dav1d are built from pinned sources by
+# build_app.py (codec_libraries), and Ocarina of Time needs no llvm or ffmpeg since 2026-11-12.
 FREE_GB = 60                            # warn below this; the measured sizes are in docs/builder-app.md
 
 
@@ -22,6 +22,13 @@ def _ok(cmd, **kw):
         return subprocess.run(cmd, capture_output=True, timeout=60, **kw).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+def _out(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
 
 
 def _free_gb(path):
@@ -41,21 +48,42 @@ def checks(work_root):
     add('mac', platform.machine() == 'arm64' and major >= 26,
         t(f'a Mac with Apple silicon and macOS 26 or later (this one: {platform.machine()}, macOS {platform.mac_ver()[0]})',
           f'Apple 芯片的 Mac，macOS 26 或更新（这台：{platform.machine()}，macOS {platform.mac_ver()[0]}）'))
-    clang = _ok(['xcrun', '--find', 'clang'])
-    add('clt', clang, t('Xcode command line tools', 'Xcode 命令行工具'), 'xcode-select --install', 'install-clt')
-    cxx = clang and _ok(['xcrun', 'clang++', '-std=c++11', '-x', 'c++', '-fsyntax-only', '-'], input=b'#include <string>\n')
-    add('cxx', cxx, t('C++ headers of the developer tools', '开发工具里的 C++ 头文件'),
-        'sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install')
-    brew = (BREW / 'bin/brew').is_file()
-    add('brew', brew, t('Homebrew', 'Homebrew（软件包管理器）'), '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"')
-    missing = [p for p in BREW_PACKAGES if not (BREW / 'opt' / p / 'lib').is_dir()]
-    add('brew-packages', not missing, t('Homebrew packages ', 'Homebrew 软件包 ') + ' + '.join(BREW_PACKAGES),
-        f'brew install {" ".join(missing or BREW_PACKAGES)}', 'brew-install' if brew else None)
-    add('git', shutil.which('git', path=os.pathsep.join(['/opt/homebrew/bin', '/usr/bin'])), 'git', 'xcode-select --install')
-    add('python', sys.version_info >= (3, 14), t(f'Python 3.14 (running {platform.python_version()})', f'Python 3.14（现在是 {platform.python_version()}）'), 'brew install python@3.14')
+    if compile_free():   # build_app.compile_free: the Launcher's source has the release's prebuilt programs
+        # a game it does not cover says so at its build (classify.PREBUILT_GAMES, tool_blocks)
+        add('tools', True, t('developer tools: not needed for Zelda, Donkey Kong Bananza and Pokopia, this Launcher brings '
+                             'the programs their build compiles (a game that needs them says so at the build)',
+                             '开发工具：塞尔达、大金刚、Pokopia 不需要，这个 Launcher 自带打包要编的程序（需要的游戏在第三步会说明）'))
+    else:
+        developer_tools(add)
+    add('python', sys.version_info >= (3, 14), t(f'Python 3.14 (running {platform.python_version()})', f'Python 3.14（现在是 {platform.python_version()}）'), t('install it from https://www.python.org/downloads/macos/', '从 https://www.python.org/downloads/macos/ 安装'))
     free = _free_gb(work_root)
     add('disk', free is not None and free >= FREE_GB,
         t(f'{FREE_GB} GB free for the work folder ({"unknown" if free is None else f"{free:.0f} GB"} free at {work_root})',
           f'工作目录要 {FREE_GB} GB 空间（{work_root} 剩 {"未知" if free is None else f"{free:.0f} GB"}）'),
         t('choose a work folder on a disk with more space', '换一个空间更大的盘放工作目录'))
     return out
+
+
+def compile_free():
+    """Every program a Mac build compiles is the release's (tools/prebuilt.py): no developer tools are checked, and
+    none of xcrun, git or make is run, since on a Mac without them each opens Apple's install dialog."""
+    from tools import prebuilt
+    from tools.builder_jobs import repo
+    return prebuilt.complete(repo.REPO)
+
+
+def developer_tools(add):
+    """A source without the prebuilt programs (a checkout) compiles them: the command line tools and their SDK."""
+    clang = _ok(['xcrun', '--find', 'clang'])
+    add('clt', clang, t('Xcode command line tools', 'Xcode 命令行工具'), 'xcode-select --install', 'install-clt')
+    sdk = _out(['xcrun', '--show-sdk-version']) if clang else ''
+    head = sdk.split('.')[0]
+    add('sdk', head.isdigit() and int(head) >= 26,
+        t(f'the macOS 26 SDK or later, with Metal 4 (the developer tools use: {sdk or "?"})',
+          f'macOS 26 或更新的 SDK，带 Metal 4（开发工具现在用的是：{sdk or "?"}）'),
+        t('update Xcode from the App Store, or use the command line tools: sudo xcode-select -s /Library/Developer/CommandLineTools',
+          '在 App Store 更新 Xcode，或改用命令行工具：sudo xcode-select -s /Library/Developer/CommandLineTools'))
+    cxx = clang and _ok(['xcrun', 'clang++', '-std=c++11', '-x', 'c++', '-fsyntax-only', '-'], input=b'#include <string>\n')
+    add('cxx', cxx, t('C++ headers of the developer tools', '开发工具里的 C++ 头文件'),
+        'sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install')
+    add('git', shutil.which('git', path=os.pathsep.join(['/opt/homebrew/bin', '/usr/bin'])), 'git', 'xcode-select --install')

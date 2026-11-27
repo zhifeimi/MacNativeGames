@@ -59,6 +59,9 @@ void runtime_core_checkpoint(void);
 void runtime_spin_wait(unsigned module, uint64_t head);   // threads.c: a pass of a gated spin wait (loader.c runtime_dispatch)
 void runtime_save_probe(void);
 int runtime_fs_save_busy(void);   /* runtime/fs_host.c: the game is writing save data (window close waits) */
+/* This game's fs_host.c mounts an external launcher's DM_SAVE folder as the save (and DM_SAVE_device as the device
+   save); the shared account.c then opens with that launcher's fixed player 1. A port without this line ignores DM_SAVE. */
+#define RUNTIME_EXTERNAL_SAVE 1
 uint8_t *runtime_module_base(const char *name);   /* runtime/loader.c: "main", "subsdk0", "sdk" (probes) */
 uint64_t runtime_module_permission(uint64_t address,uint64_t size,unsigned permission);
 uint64_t runtime_module_lock_permission(uint64_t address,uint64_t size,unsigned mask,unsigned attribute);
@@ -144,7 +147,7 @@ void runtime_aspect_view(double w, double h);   /* frontend.m: the window's draw
 float runtime_aspect_now(void);     /* the ratio in force, 0 = the game's own 16:9 */
 void runtime_front_resize_aspect(double ratio);   /* Mac: resize the window to a selected picture ratio */
 int hud_compact(void);   /* gfx/nvn/fps_overlay.c: the overlay lines go to the window's corner panel (TOTK_HUD=corners: in the picture) */
-int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line 0..3: FPS, shaders, render pipelines, load; 0 = not published */
+int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line: fps_overlay.h HUD_* (drawn in HUD_ORDER); 0 = not published */
 
 void *runtime_account_override(const char *name);
 
@@ -229,6 +232,22 @@ void runtime_mouse_release(void);                   /* main thread: buttons up, 
 void runtime_capture_set_hook(void (*hook)(void));
 void runtime_capture_press(void) __attribute__((weak));   /* gamepad.m (weak: probes that link input.c alone): the capture button pressed once (the input file's "capture") */
 void runtime_gamepad_switch_capture(void *controller, int pressed);   /* Switch 0x30 report: 1 while the button is down (any queue) */
+int runtime_dsu_motion_active(void);     /* fresh DSU six-axis samples currently own motion, not just an open socket */
+typedef struct {
+    int enabled, slot, locked;
+    char endpoint[264];
+} RuntimeDSUSettings;
+typedef struct {
+    int connected, sensor;
+    double acc[3], gyro[3];   /* gyro in degrees/second for the settings display */
+    uint32_t buttons;
+    uint8_t axes[4];
+    char error[160];
+} RuntimeDSUStatus;
+void runtime_dsu_settings(RuntimeDSUSettings *out);   /* main queue; environment overrides saved preferences */
+void runtime_dsu_status(RuntimeDSUStatus *out);       /* main queue; passive snapshot */
+int runtime_dsu_apply(const RuntimeDSUSettings *settings); /* 0 applied and saved, -1 invalid, -2 environment locked */
+void runtime_feedback_motion_source_changed(void);   /* switch between DSU and native motion without changing rumble */
 void runtime_touch_pad_set(const RuntimeGamepadState *state);   /* on-screen touch controls (iOS) */
 int runtime_phone_fps(void);                /* d2r_gfx hle_nvn.c, iPhone / iPad: 30 while held at 30 (TOTK_PHONE_FPS), else 60 */
 void runtime_phone_fps_set(int fps);        /* 30 holds 30, anything else up to 60: the touch controls' button, at once */

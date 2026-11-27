@@ -17,6 +17,7 @@
 #include "ns2_resolution.h"
 #include "totk_shader_contrib.h"   // totk_contrib_prune
 #include "totk_contrib_upload.h"   // the shader inbox: asked once, sent while playing
+#import "mng_active.h"             // the day's report of active players
 #import "touch_pad.h"
 #import "start_screen.h"
 
@@ -602,6 +603,7 @@ static void apply_settings(void) {
     // Controller input does not reset the idle timer; auto-lock would suspend the game mid-play or mid shader import.
     application.idleTimerDisabled = YES;
     audio_observe();
+    mng_active_start(@"oot", mng_active_version());   // the day's report of active players (off in the Settings app's pane)
     /* The Mac launcher passes the preferred language as TOTK_LOCALE (PR #97); "zh-Hans-CN" maps to zh-Hans in services.c. */
     NSString *preferred = NSLocale.preferredLanguages.firstObject;
     if (preferred.length) setenv("TOTK_LOCALE", preferred.UTF8String, 1);
@@ -711,7 +713,7 @@ static void apply_settings(void) {
     });
     // Shaders the shared list lacks (totk_shader_contrib.h), contributed over HTTPS when the player lets it (totk_contrib_upload.h).
     // What this app's seed and warm lists (beside the seed: DM_NVN_SHMAP) serve leaves it first, so the Mac sends only the rest.
-    NSString *contrib = [docs stringByAppendingPathComponent:@"shader-list-contribution.txt"];
+    NSString *contrib = totk_inbox_claim([docs stringByAppendingPathComponent:@"shader-list-contribution.txt"]);   // this game's file only
     totk_contrib_prune(contrib, seedDir, seedDir);
     setenv("TOTK_SHADER_CONTRIB",contrib.fileSystemRepresentation,1);
     contrib_settings_sync(contrib);
@@ -719,7 +721,7 @@ static void apply_settings(void) {
     // The Settings switch turned while the game runs (the app comes back from Settings): on starts, off stops the sending.
     [NSNotificationCenter.defaultCenter addObserverForName:NSUserDefaultsDidChangeNotification object:nil queue:nil
         usingBlock:^(NSNotification *n) { (void)n; contrib_settings_sync(contrib); totk_inbox_start(contrib, @"ios"); }];
-    // ... with the game and version it came from, so a file sent by hand in an issue names them
+    // ... with the game and version it came from, so the file names them
     setenv("TOTK_CONTRIB_GAME",GAME_FOLDER " " TOTK_GAME_VERSION,1);
     setenv("DM_NVN_SHMAP",[seedDir stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation,1);
     setenv("DM_MSL_DIR",seedDir.fileSystemRepresentation,1);

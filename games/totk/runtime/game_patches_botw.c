@@ -18,6 +18,7 @@
 #include "botw_fov.h"   /* 1.9.0's field of view (TOTK_FOV_SCALE, graphics-fov.txt) */
 #include "botw_heap_patch.h"   /* startup/root heap sizes above 4 GiB */
 #include "botw_output_heaps.h"
+#include "../third_party/d2r_gfx/gfx/nvn/mfx_target.h"   /* mfx_target_pack: 4K + MetalFX's fixed 5K output */
 #include "../zeldaVR/gfx/vr_resolution_policy.h"
 #include <TargetConditionals.h>
 #include <mach/mach.h>   /* vm_read_overwrite: TOTK_CDPOINT_TRACE reads guest pointers it cannot vouch for */
@@ -539,6 +540,156 @@ static void patch_blend_first_step(Module *m, uint64_t stub) {
     fprintf(stderr, "[botw] camera blends start with one 30 fps frame, then follow the measured ratio (veneer +%#llx; TOTK_BLEND_FIRST_STEP=0: as shipped)\n",
             (unsigned long long)stub);
 }
+/* Moving platforms above 30 fps (TOTK_KF_ANGLE=0: as shipped). The bodies the game moves (a Divine Beast's floor while
+   it tilts, lifts, gates) get each physics step the angular velocity that takes them to their target; main+0x12d57fc
+   takes the angle of the turn left from hkQuaternion::getAngle (main+0xb06d4), 2 acos(|w|). Below about a milliradian
+   w rounds to 1.0 in a float and the turn reads as none. Vah Medoh's floor turns about 1.7 mrad per 30 fps frame, less
+   per step at higher rates: the floor stood still for some steps and then caught up at once, and Link on it hopped in
+   place, more the higher the frame rate, not at 30+30 (user, 2026-11-13). Cause and cure as found by SavageWindRecomp
+   (pull request #312: at 120 fps, Link's vertical speed jitter fell from 0.9-1.6 m/s to 0.07-0.13). The call now goes to
+   a veneer that returns 2 atan2(|xyz|, |w|), the same angle without the rounding, through the game's own atan2f import
+   (PLT main+0x159ff10, GOT main+0x1d78050). getAngle's caller only reads s0 back (main+0x12d5804) and keeps its values on
+   the stack across the call; the veneer uses only caller-saved registers, as getAngle and its acosf call do. */
+static void patch_kf_angle(Module *m, uint64_t stub) {
+    const char *e = getenv("TOTK_KF_ANGLE");
+    if (!ios_code() && e && !strcmp(e, "0")) { fprintf(stderr, "[botw] moving platforms' turn angle as shipped, 2 acos(|w|) (TOTK_KF_ANGLE=0)\n"); return; }
+    enum { SITE = 0x12d57fc, ATAN2F = 0x159ff10 };
+    static const struct { uint32_t off, original; } check[] = {
+        {0x12d57f8u, 0x3c9983a0u},     /* stur q0, [x29, #-0x68] */
+        {0x12d57fcu, 0x97b76bb6u},     /* bl main+0xb06d4 (hkQuaternion::getAngle) */
+        {0x12d5800u, 0x3cd883a6u},     /* ldur q6, [x29, #-0x78] */
+        {0x12d5804u, 0x1e2008c0u},     /* fmul s0, s6, s0 */
+        {0xb06d4u, 0x3dc00000u},       /* ldr q0, [x0] */
+        {0xb06f8u, 0x9453bdf6u},       /* bl main+0x159fed0 (acosf) */
+        {0x159ff10u, 0xb0003ed0u},     /* adrp x16, main+0x1d78000 */
+        {0x159ff14u, 0xf9402a11u},     /* ldr x17, [x16, #0x50] (atan2f) */
+        {0x159ff1cu, 0xd61f0220u},     /* br x17 */
+    };
+    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof check / sizeof *check; i++) {
+        uint32_t w; memcpy(&w, m->base + check[i].off, 4);
+        if (w != check[i].original) {
+            fprintf(stderr, "[botw] moving platforms main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
+            runtime_fail("the moving platforms' turn angle requires the 1.9.0 keyframed-body code");
+        }
+    }
+    const uint32_t veneer[] = {
+        0x3dc00000u,   /* ldr q0, [x0]                 x, y, z, w of the turn left */
+        0x6e20dc01u,   /* fmul v1.4s, v0.4s, v0.4s */
+        0x7e30d822u,   /* faddp s2, v1.2s              x² + y² */
+        0x5e140423u,   /* mov s3, v1.s[2] */
+        0x1e232842u,   /* fadd s2, s2, s3              + z² */
+        0x5e1c0401u,   /* mov s1, v0.s[3] */
+        0x1e20c021u,   /* fabs s1, s1                  |w| */
+        0x1e21c040u,   /* fsqrt s0, s2                 |xyz| */
+        0xa9bf7bfdu,   /* stp x29, x30, [sp, #-16]! */
+        0x910003fdu,   /* mov x29, sp */
+        0x94000000u | (uint32_t)((((int64_t)ATAN2F - (int64_t)(stub + 40)) >> 2) & 0x3ffffff),   /* bl atan2f */
+        0xa8c17bfdu,   /* ldp x29, x30, [sp], #16 */
+        0x1e202800u,   /* fadd s0, s0, s0              2 atan2(|xyz|, |w|) */
+        0xd65f03c0u,   /* ret */
+    };
+    if (stub + sizeof veneer > ((m->text_end + 0xfff) & ~0xfffULL)) runtime_fail("moving platforms veneer layout");
+    for (size_t i = 0; !CODE_PATCHED_AT_BUILD && i < sizeof veneer; i++) if (m->base[stub + i]) runtime_fail("moving platforms veneer padding not empty");
+    put_words(m, stub, veneer, sizeof veneer / sizeof *veneer, "moving platforms veneer");
+    put_word(m, SITE, 0x94000000u | (uint32_t)((((int64_t)stub - (int64_t)SITE) >> 2) & 0x3ffffff), "moving platforms turn angle");
+    fprintf(stderr, "[botw] moving platforms: the turn angle is 2 atan2(|xyz|, |w|), small turns kept (veneer +%#llx; TOTK_KF_ANGLE=0: as shipped)\n",
+            (unsigned long long)stub);
+}
+/* Arrows above 30 fps (TOTK_ARROW_GRAVITY=0: as shipped; Mac only). Once an arrow falls, its update (main+0x5ee668,
+   x20 = the arrow) makes its velocity the last one's direction x its speed (+0xb4) plus a gravity vector whose Y part
+   is +0x108, in metres per console frame (x 30 for its body, main+0x5ee764), with no time step: each update turns the
+   arrow down by the same angle, so at 120 fps it turned four times as fast a second and landed short. Cause and cure as
+   found by Savage Wind Recomp (#144, its tools/patches.py _arrow_gravity): the gravity is scaled by the frame's length
+   in 30 fps frames, the ratio of the frame-step page (1.0 at 30 fps, the shipped value; slow motion left out, as on the
+   console). x8 and s3 are free there: x8 is set again before it is read (main+0x5ee74c, after a call) and s3 is not read
+   again before the call at main+0x5ee744:
+     main+0x5ee734  ldr s1, [x20, #0x108]  -> b <veneer>
+     veneer         ldr s1, [x20, #0x108] / adrp x8, <page> / ldr s3, [x8] / fmul s1, s1, s3 / b main+0x5ee738 */
+static void patch_arrow_gravity(Module *m, uint64_t page, uint64_t stub) {
+    const char *e = getenv("TOTK_ARROW_GRAVITY");
+    if (ios_code()) { fprintf(stderr, "[botw] arrows' gravity once per update, as shipped (the Mac fix is not in the iPhone and iPad export)\n"); return; }
+    if (e && !strcmp(e, "0")) { fprintf(stderr, "[botw] arrows' gravity once per update, as shipped (TOTK_ARROW_GRAVITY=0)\n"); return; }
+    enum { SITE = 0x5ee734, BACK = 0x5ee738 };
+    static const struct { uint32_t off, original; } check[] = {
+        {0x5ee71cu, 0xbd40b680u},   /* ldr s0, [x20, #0xb4]   (speed) */
+        {0x5ee724u, 0xbd410683u},   /* ldr s3, [x20, #0x104] */
+        {0x5ee730u, 0x1e232828u},   /* fadd s8, s1, s3        (s3's last read) */
+        {SITE, 0xbd410a81u},        /* ldr s1, [x20, #0x108]  (gravity, Y) */
+        {BACK, 0x1e212849u},        /* fadd s9, s2, s1 */
+        {0x5ee744u, 0x94150f9fu},   /* bl main+0xb325c0 */
+        {0x5ee74cu, 0xf9404288u},   /* ldr x8, [x20, #0x80] */
+        {0x5ee764u, 0x1e27d000u},   /* fmov s0, #30.0         (per console frame x 30) */
+    };
+    for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
+        uint32_t w; memcpy(&w, m->base + check[i].off, 4);
+        if (w != check[i].original) {
+            fprintf(stderr, "[botw] arrow gravity main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
+            runtime_fail("arrows' gravity by real time requires the 1.9.0 arrow fall update");
+        }
+    }
+    const uint32_t veneer[] = {
+        0xbd410a81u,   /* ldr s1, [x20, #0x108] */
+        adrp_reg(8, (uintptr_t)m->base + stub + 4, page),
+        0xbd400103u,   /* ldr s3, [x8]          (the measured ratio) */
+        0x1e230821u,   /* fmul s1, s1, s3 */
+        branch_to(stub + 16, BACK),
+    };
+    if (stub + sizeof veneer > ((m->text_end + 0xfff) & ~0xfffULL)) runtime_fail("arrow gravity veneer layout");
+    for (size_t i = 0; i < sizeof veneer; i++) if (m->base[stub + i]) runtime_fail("arrow gravity veneer padding not empty");
+    put_words(m, stub, veneer, sizeof veneer / sizeof *veneer, "arrow gravity veneer");
+    put_word(m, SITE, branch_to(SITE, stub), "arrow gravity");
+    fprintf(stderr, "[botw] arrows: the gravity added per update follows the measured frame ratio (veneer +%#llx; TOTK_ARROW_GRAVITY=0: as shipped)\n",
+            (unsigned long long)stub);
+}
+/* The sound's clock above 60 fps (TOTK_SOUND_FRAME=0: as shipped; Mac only). Once a frame main+0x1550fcc hands the sound
+   system the VFR's delta frame (main+0x59c788), at least 0.5, in console frames: it steps the audio frame (main+0xf07808)
+   and is stored at +0x84 of [main+0x1e37038], the field 1.6.0's patch_slink_rate stores (floor 1.0 there). The floor is a
+   60 fps frame, so above 60 fps the sound's clock ran fast, x2 at 120 fps: every sound timer and fade, and the field battle
+   music, which started each segment while the last one still played. Cause and cure as found by Savage Wind Recomp (#145,
+   its runtime/hle/framepace.c rt_snd_frame_floor): the floor is 0.5 x the frame's length in 30 fps frames, the ratio of
+   the frame-step page: 0.5 at 30 fps as shipped (slow motion floored as on the console), the frame's own length above.
+   x8 and s2 are free there: x8 is set again at main+0x1551034 before it is read, s2 is not read before the call at
+   main+0x1551010, and s0 (the delta) is kept for the fcmp after:
+     main+0x1551004  fmov s1, #0.5  -> b <veneer>
+     veneer          fmov s1, #0.5 / adrp x8, <page> / ldr s2, [x8] / fmul s1, s1, s2 / b main+0x1551008 */
+static void patch_sound_frame(Module *m, uint64_t page, uint64_t stub) {
+    const char *e = getenv("TOTK_SOUND_FRAME");
+    if (ios_code()) { fprintf(stderr, "[botw] the sound's frame at least a 60 fps frame, as shipped (the Mac fix is not in the iPhone and iPad export)\n"); return; }
+    if (e && !strcmp(e, "0")) { fprintf(stderr, "[botw] the sound's frame at least a 60 fps frame, as shipped (TOTK_SOUND_FRAME=0)\n"); return; }
+    enum { SITE = 0x1551004, BACK = 0x1551008 };
+    static const struct { uint32_t off, original; } check[] = {
+        {0x1550ffcu, 0xaa1303e0u},   /* mov x0, x19 */
+        {0x1551000u, 0x97c12de2u},   /* bl main+0x59c788        (the VFR's delta frame) */
+        {SITE, 0x1e2c1001u},         /* fmov s1, #0.5 */
+        {BACK, 0x1e212000u},         /* fcmp s0, s1 */
+        {0x155100cu, 0x1e204c28u},   /* fcsel s8, s1, s0, mi    (s8: the larger) */
+        {0x1551010u, 0x97e6e0f8u},   /* bl main+0xf093f0 */
+        {0x1551030u, 0x97e6d9f6u},   /* bl main+0xf07808        (the audio frame) */
+        {0x1551034u, 0xd0004728u},   /* adrp x8, main+0x1e37000 */
+        {0x1551038u, 0x9100e108u},   /* add x8, x8, #0x38 */
+        {0x1551040u, 0xbd008508u},   /* str s8, [x8, #0x84] */
+    };
+    for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
+        uint32_t w; memcpy(&w, m->base + check[i].off, 4);
+        if (w != check[i].original) {
+            fprintf(stderr, "[botw] sound frame main+%#x: found %08x expected %08x\n", check[i].off, w, check[i].original);
+            runtime_fail("the sound's frame by real time requires the 1.9.0 sound system update");
+        }
+    }
+    const uint32_t veneer[] = {
+        0x1e2c1001u,   /* fmov s1, #0.5 */
+        adrp_reg(8, (uintptr_t)m->base + stub + 4, page),
+        0xbd400102u,   /* ldr s2, [x8]          (the measured ratio) */
+        0x1e220821u,   /* fmul s1, s1, s2 */
+        branch_to(stub + 16, BACK),
+    };
+    if (stub + sizeof veneer > ((m->text_end + 0xfff) & ~0xfffULL)) runtime_fail("sound frame veneer layout");
+    for (size_t i = 0; i < sizeof veneer; i++) if (m->base[stub + i]) runtime_fail("sound frame veneer padding not empty");
+    put_words(m, stub, veneer, sizeof veneer / sizeof *veneer, "sound frame veneer");
+    put_word(m, SITE, branch_to(SITE, stub), "sound frame floor");
+    fprintf(stderr, "[botw] the sound's frame: its floor is 0.5 x the measured frame ratio (veneer +%#llx; TOTK_SOUND_FRAME=0: as shipped)\n",
+            (unsigned long long)stub);
+}
 static void patch_realtime(Module *m) {
     uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL;
     if (data_off + 0x4000 != m->size || data_off & 0xfff) runtime_fail("real-time frame-step page layout");
@@ -575,7 +726,10 @@ static void patch_realtime(Module *m) {
                     "(%zu instructions, %zu verified); initial 33.33 ms, sampled at each present (TOTK_REALTIME=0: as shipped)\n",
             sizeof put / sizeof *put, sizeof check / sizeof *check);
     patch_pad_repeat(m, page);
+    patch_sound_frame(m, page, ((m->text_end + 15) & ~15ULL) + 0x360);   /* past the moving platforms' (+0x300, 14 words) and the arrows' (+0x340, 5) veneers */
     patch_blend_first_step(m, ((m->text_end + 15) & ~15ULL) + 80);   /* after the FOV stub (+32, 11 words) */
+    patch_kf_angle(m, ((m->text_end + 15) & ~15ULL) + 0x300);        /* past the VR and heap veneers (+0x80..+0x158) */
+    patch_arrow_gravity(m, page, ((m->text_end + 15) & ~15ULL) + 0x340);   /* after the moving platforms' veneer (14 words) */
 }
 #endif
 /* Diagnostics (TOTK_JQ_CHECK=1): random crashes look like one job run twice (two threads in the same skinning job, a list
@@ -651,16 +805,37 @@ enum { RENDER_MOVZ = 0x12660bc, RENDER_MOVK = 0x12660c8 };
    Switch's own 1600x900 scene, which the game upscales into the 1920x1080 canvas. Handheld play does not read the pair. */
 static uint64_t output_floats(unsigned screen, unsigned render);   /* {screen, render width} as two floats */
 static int phone_scene_hd(void) { const char *e = getenv("TOTK_BOTW_SCENE"); return e && !strcmp(e, "1920x1080"); }
+/* The custom scene size (user 2026-11-17: the pane's TOTK_RENDER_RES, handed over only while "Use custom settings" is on;
+   ios/tools/build_ipa.py botw_pane, ios/Sources/settings_map.c): its width in the mode whose canvas is canvas_w wide (docked
+   1920, handheld 1280); 0 keeps the presets' scene. A size above that canvas is held at the canvas: above it the game cannot
+   make its heaps (patch_render_1080), so 1600x900 and 1920x1080 are docked sizes and handheld plays them at 1280x720
+   (user 2026-11-17: the list stays open for faster iPads and iPhones). Lower sizes cost the GPU less, for heat and battery;
+   MetalFX's scene upscale (TOTK_MFX_UPSCALE) can then replace the game's own upscale into the canvas. Read at start, before
+   the first display-mode run. */
+static unsigned phone_scene_custom(unsigned canvas_w) {
+    static const struct { const char *size; unsigned width; } sizes[] = {
+        {"1920x1080", 1920}, {"1600x900", 1600}, {"1280x720", 1280}, {"960x540", 960}, {"800x450", 800}, {"640x360", 640}};
+    const char *e = getenv("TOTK_RENDER_RES");
+    if (!e || !*e) return 0;
+    for (size_t i = 0; i < sizeof sizes / sizeof *sizes; i++) {
+        if (strcmp(e, sizes[i].size)) continue;
+        if (sizes[i].width <= canvas_w) return sizes[i].width;
+        fprintf(stderr, "[botw] scene %s is above this mode's %ux%u canvas; %ux%u here\n", e, canvas_w, canvas_w * 9 / 16, canvas_w, canvas_w * 9 / 16);
+        return canvas_w;
+    }
+    fprintf(stderr, "[botw] scene %s is not one of the pane's sizes (1920x1080 to 640x360); the presets' scene\n", e);
+    return 0;
+}
 static void patch_render_phone(Module *m) {
     uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL;
     if (data_off + 0x4000 != m->size) runtime_fail("the docked scene size: no data page after the main module");
     const uint64_t page = (uintptr_t)m->base + data_off;
     put_word(m, RENDER_MOVZ, adrp_reg(8, (uintptr_t)m->base + RENDER_MOVZ, page), "docked render size");   /* adrp x8, page */
     put_word(m, RENDER_MOVK, 0xf9400908u, "docked render size");   /* ldr x8, [x8, #16]: {screen, render width} */
-    const unsigned render = phone_scene_hd() ? 1920 : 1600;
+    const unsigned custom = phone_scene_custom(1920), render = custom ? custom : phone_scene_hd() ? 1920 : 1600;
     atomic_store((_Atomic uint64_t *)(void *)(page + 16), output_floats(1920, render));
-    fprintf(stderr, "[botw] docked render size %ux%u into the 1920x1080 canvas (%s; TOTK_BOTW_SCENE)\n", render, render * 9 / 16,
-            render == 1920 ? "HD" : "as on the Switch");
+    fprintf(stderr, "[botw] docked render size %ux%u into the 1920x1080 canvas (%s)\n", render, render * 9 / 16,
+            custom ? "custom; TOTK_RENDER_RES" : render == 1920 ? "HD; TOTK_BOTW_SCENE" : "as on the Switch; TOTK_BOTW_SCENE");
 }
 static void patch_render_1080(Module *m) {
     const char *e = getenv("TOTK_RENDER_RES");
@@ -764,15 +939,18 @@ static uint32_t native_word(uint32_t original, int kind, int k) {   /* the same 
    mode, whose branch of the 1.6.0 display-mode routine (jump table at main+0x26164f8: mode 1 -> main+0x18216c8) stores
    the screen width 1280.0 and the render width 1280.0 as one pair:
      main+0x18216c8  mov x8, #0x44a00000              (1280.0, the screen)
-     main+0x18216cc  movk x8, #0x44a0, lsl #48        (1280.0, the render width) -> movk x8, #0x4470, lsl #48 (960.0)
+     main+0x18216cc  movk x8, #0x44a0, lsl #48        (1280.0, the render width; the first patch made it 960.0, now both words load the pair, below)
    The renderer scales its targets by render / screen width, as docked play does at 1600 / 1920, so the scene is drawn at
-   960x540 and the game's own upscale draws it into the 1280x720 canvas (MetalFX does not replace it on the phone:
-   totk_mfx_up.m mfxup_enabled).
+   960x540 and the game's own upscale draws it into the 1280x720 canvas (MetalFX replaces it on the phone only with the
+   pane's custom switch and MetalFX row on: totk_mfx_up.m mfxup_enabled, TOTK_MFX_UPSCALE).
    1.9.0: the display-mode routine main+0x1266074 jumps by a byte table (main+0x1725916, base main+0x12660bc): mode 1 ->
    main+0x1266114, the same pair (str x8, [x19, #0x1210]); mode 3 (VR) computes its own and is left alone:
      main+0x1266114  mov x8, #0x44a00000
-     main+0x1266118  movk x8, #0x44a0, lsl #48        -> movk x8, #0x4470, lsl #48 (960.0)
-   (its dynamic-resolution scale, main+0x12661e8, divides the render width +0x1214 by 1280.0 in handheld: 0.75). */
+     main+0x1266118  movk x8, #0x44a0, lsl #48        (likewise: the pair from the data page, below)
+   (its dynamic-resolution scale, main+0x12661e8, divides the render width +0x1214 by 1280.0 in handheld: 0.75).
+   The pair comes from the data page after main (+0x28; +16 is the docked pair, +0x20 the ultrawide word), as the docked
+   one does (patch_render_phone): mov x8 / movk x8 become adrp x8, <data page> / ldr x8, [x8, #0x28], and the start writes
+   {1280.0, render width} there: 960.0, or the custom scene's width (phone_scene_custom; user 2026-11-17). */
 #ifdef GAME_BOTW160
 enum { PHONE_RENDER = 0x18216c8u, PHONE_RENDER_STR = 0xf9094b88u };   /* str x8, [x28, #0x1290] */
 #else
@@ -788,8 +966,15 @@ static void patch_phone_render(Module *m) {
             runtime_fail("the phone's render size requires the " TOTK_GAME_VERSION " handheld display-mode instructions");
         }
     }
-    put_word(m, PHONE_RENDER + 4, 0xf2e88e08u, "handheld render size");   /* movk x8, #0x4470, lsl #48: 960.0 */
-    fprintf(stderr, "[botw] handheld render size 960x540, the game's own upscale to the 1280x720 canvas (phone)\n");
+    uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL;
+    if (data_off + 0x4000 != m->size) runtime_fail("the handheld scene size: no data page after the main module");
+    const uint64_t page = (uintptr_t)m->base + data_off;
+    put_word(m, PHONE_RENDER, adrp_reg(8, (uintptr_t)m->base + PHONE_RENDER, page), "handheld render size");   /* adrp x8, page */
+    put_word(m, PHONE_RENDER + 4, 0xf9401508u, "handheld render size");   /* ldr x8, [x8, #0x28]: {screen, render width} */
+    const unsigned custom = phone_scene_custom(1280), render = custom ? custom : 960;
+    atomic_store((_Atomic uint64_t *)(void *)(page + 0x28), output_floats(1280, render));
+    fprintf(stderr, "[botw] handheld render size %ux%u, the game's own upscale to the 1280x720 canvas (phone%s)\n", render, render * 9 / 16,
+            custom ? "; custom, TOTK_RENDER_RES" : "");
 }
 #ifdef GAME_BOTW190
 /* The sun shadow map at 2048 per cascade (botw_shadow_res.h): TOTK_SHADOW_RES=2048, or 2048 in shadows.txt (the settings
@@ -1116,6 +1301,132 @@ static void patch_font_size(Module *m) {
             "(reference table, main+%#x TextScaleOn) (TOTK_FONT_RES=0 keeps 720p)\n",
             h / 720.0, h, big[1], big[2], big[3], big[0], FONT_SCALE);
 }
+/* Sharp UI captures, 1.9.0 and 1.6.0. A layout pane named N_Capture_* (and N_CaptureText_*, ...) is not drawn to the
+   screen: the game draws it into a texture of its own, and pictures of the layout show that texture (DemoName_00, the
+   name card of a character intro: the name and subtitle text boxes under N_Capture_00..02, shown by P_Name_00/01 and
+   P_SubText_00/01 with a light sweep). Both textures take the pane's size in layout units (1280x720), so on a 1944-line
+   canvas the picture stretches them 2.7x and the brush-style heading is blurry:
+   - the kept texture (1.9.0 main+0xf59710..0xf597b0, 1.6.0 main+0x1351720..0x13517d8): pane width / height
+     (+0x50 / +0x54) x the pane's user data "CaptureScale" (used only when it is in (0, 1)), rounded (+-0.5, fcvtzs) and
+     given to the texture maker (1.9.0 main+0xed6ae0, 1.6.0 main+0x1296030);
+   - the render target of each capture pass (1.9.0 main+0xf5a028, 1.6.0 main+0x13508e0): the same width / height (x the
+     pane's global scale when +0xda bit 6 and a global flag are set) truncated (fcvtzu) for its viewport, with the pane's
+     own size as the projection, then copied into the kept texture. A pane with +0xda bit 4 sizes the render target from
+     the screen instead (pane size x render target / layout, so 2.7x on a 1944-line canvas), but its kept texture still
+     takes the pane's size: the big heading of the name card (700x114 kept, 1890x307 drawn) is such a pane.
+   Two stubs multiply both sizes by k = canvas height / 720, the font raster's factor (patch_font_size): the pane is drawn
+   k times finer into a k times larger texture, and the pictures show it at the same place and size. Stub A scales every
+   kept texture (bit-4 panes too), stub B the render target of a pane without bit 4, rounded as the kept one so the copy
+   fills it. Panes of a quarter of the 1280x720 layout or more (the 1280x720 blurred backgrounds of the pause menu, map
+   and system windows: 26-38 MiB each at k = 2.7) stay as shipped; the text captures are 0.1-5.5 MiB each at k = 2.7.
+   Only panes at least 150 layout units wide are scaled (TOTK_CAPTURE_MIN_W): the text captures (name cards, quest and
+   location names, messages, button labels) are wide; the narrow ones are icons and gauges, and the scaled stamina gauge
+   (PaGanbariGauge_01, 80x80 and 90x90, six half-ring pictures in one capture) showed a vertical line through the ring.
+   The second CaptureScale reader (1.9.0 main+0xf60e24, 1.6.0 main+0x135bca0) is another capture path that the name
+   card does not take; it stays as shipped. 1.6.0 compiles the pass differently (the size goes to s0 / s1 with x0 = the
+   pane, not s10 / s11 with x24), so its stub B differs; stub A is the same. TOTK_CAPTURE_RES=0 keeps all as shipped. */
+#ifdef GAME_BOTW190
+static const struct { uint32_t off, original; } g_capture_check[] = {
+    {0xf59710u, 0x2d4a2269u},   /* ldp s9, s8, [x19, #0x50]: the pane's width and height */
+    {0xf59744u, 0x1e200929u},   /* fmul s9, s9, s0: x CaptureScale */
+    {0xf5974cu, 0x1e202128u},   /* fcmp s9, #0.0 (site A) */
+    {0xf59750u, 0x1e3c1000u},   /* fmov s0, #-0.5: s0, s1 and w8 are written before they are read */
+    {0xf597a8u, 0x1e380044u},   /* fcvtzs w4, s2: the kept texture's width */
+    {0xf597acu, 0x1e380005u},   /* fcvtzs w5, s0: its height */
+    {0xf5a058u, 0x2d4a2408u},   /* ldp s8, s9, [x0, #0x50]: the pass's pane size */
+    {0xf5a070u, 0xaa0003f8u},   /* mov x24, x0: the pane */
+    {0xf5a0b8u, 0x1e20412au},   /* fmov s10, s9 (site B) */
+    {0xf5a0bcu, 0x1e20410bu},   /* fmov s11, s8 */
+    {0xf5a0c4u, 0x36200188u},   /* tbz w8, #4: the screen-sized target replaces s10 / s11 */
+    {0xf5a104u, 0x1e390164u},   /* fcvtzu w4, s11: the render target's width */
+    {0xf5a118u, 0x1e390145u},   /* fcvtzu w5, s10: its height */
+};
+enum { CAPTURE_SITE_A = 0xf5974c, CAPTURE_SITE_B = 0xf5a0b8 };
+#define CAPTURE_STUB_B   /* x24 = pane, s8 / s9 = the pass's width / height -> s11 / s10 */ \
+    0x1e20412au, 0x1e20410bu,   /* fmov s10, s9 / fmov s11, s8 (as shipped) */ \
+    0xbd405300u, 0x1c0001c1u, 0x1e212000u, 0x5400014bu,   /* ldr s0, [x24, #0x50] / ldr s1, minw / fcmp s0, s1 / b.lt ret */ \
+    0x2d4a0700u, 0x1e210800u,   /* ldp s0, s1, [x24, #0x50] / fmul s0, s0, s1: the pane's area */ \
+    0x1c000101u, 0x1e212000u, 0x540000aau,   /* ldr s1, area / fcmp s0, s1 / b.ge ret */ \
+    0x1c0000e0u, 0x1e2c1001u,   /* ldr s0, k / fmov s1, #0.5 */ \
+    0x1f00052au, 0x1f00050bu,   /* fmadd s10, s9, s0, s1 / fmadd s11, s8, s0, s1: rounded as the kept texture */ \
+    0xd65f03c0u   /* ret */
+#else
+static const struct { uint32_t off, original; } g_capture_check[] = {
+    {0x1351720u, 0x2d4a2269u},   /* ldp s9, s8, [x19, #0x50]: the pane's width and height */
+    {0x1351764u, 0x1e291c29u},   /* fcsel s9, s1, s9, ne: x CaptureScale */
+    {0x135176cu, 0x1e202128u},   /* fcmp s9, #0.0 (site A) */
+    {0x1351770u, 0x1e3c1000u},   /* fmov s0, #-0.5: s0, s1 and w8 are written before they are read */
+    {0x1351790u, 0x1e380045u},   /* fcvtzs w5, s2: the kept texture's width */
+    {0x1351798u, 0x1e380006u},   /* fcvtzs w6, s0: its height */
+    {0x1350914u, 0x2d4a2408u},   /* ldp s8, s9, [x0, #0x50]: the pass's pane size, x0 = the pane */
+    {0x1350968u, 0x4ea91d20u},   /* mov v0.16b, v9.16b (site B) */
+    {0x135096cu, 0x4ea81d01u},   /* mov v1.16b, v8.16b */
+    {0x1350970u, 0xa90403eau},   /* stp x10, x0, [sp, #0x40]: x0 is still the pane */
+    {0x1350974u, 0x36200188u},   /* tbz w8, #4: the screen-sized target replaces s0 / s1 (s2, s3 are free here) */
+    {0x13509dcu, 0x1e39003cu},   /* fcvtzu w28, s1: the render target's width */
+    {0x13509e0u, 0x1e390016u},   /* fcvtzu w22, s0: its height */
+};
+enum { CAPTURE_SITE_A = 0x135176c, CAPTURE_SITE_B = 0x1350968 };
+#define CAPTURE_STUB_B   /* x0 = pane, s8 / s9 = the pass's width / height -> s1 / s0 */ \
+    0x4ea91d20u, 0x4ea81d01u,   /* mov v0.16b, v9.16b / mov v1.16b, v8.16b (as shipped) */ \
+    0xbd405002u, 0x1c0001c3u, 0x1e232040u, 0x5400014bu,   /* ldr s2, [x0, #0x50] / ldr s3, minw / fcmp s2, s3 / b.lt ret */ \
+    0x2d4a0c02u, 0x1e230842u,   /* ldp s2, s3, [x0, #0x50] / fmul s2, s2, s3: the pane's area */ \
+    0x1c000103u, 0x1e232040u, 0x540000aau,   /* ldr s3, area / fcmp s2, s3 / b.ge ret */ \
+    0x1c0000e2u, 0x1e2c1003u,   /* ldr s2, k / fmov s3, #0.5 */ \
+    0x1f020d20u, 0x1f020d01u,   /* fmadd s0, s9, s2, s3 / fmadd s1, s8, s2, s3: rounded as the kept texture */ \
+    0xd65f03c0u   /* ret */
+#endif
+enum { CAPTURE_STUB_B_AT = 14, CAPTURE_MIN_W = 31, CAPTURE_K = 32 };
+static const uint32_t g_capture_stub[] = {   /* stubs A and B, then their three literals; 33 words */
+    /* A: x19 = pane, s9 / s8 = the kept texture's width / height; ends with the fcmp it replaces */
+    0xbd405260u, 0x1c0003c1u, 0x1e212000u, 0x5400012bu,   /* ldr s0, [x19, #0x50] / ldr s1, minw / fcmp s0, s1 / b.lt A+0x30 */
+    0x2d4a0660u, 0x1e210800u,   /* ldp s0, s1, [x19, #0x50] / fmul s0, s0, s1: the pane's area */
+    0x1c000301u, 0x1e212000u, 0x5400008au,   /* ldr s1, area / fcmp s0, s1 / b.ge A+0x30 */
+    0x1c0002e0u, 0x1e200929u, 0x1e200908u,   /* ldr s0, k / fmul s9, s9, s0 / fmul s8, s8, s0 */
+    0x1e202128u, 0xd65f03c0u,   /* fcmp s9, #0.0 / ret */
+    CAPTURE_STUB_B,
+    0x48610000u,   /* area: 230400.0f, a quarter of 1280x720 */
+    0x43160000u,   /* minw: 150.0f, set below */
+    0x3f800000u,   /* k: set below */
+};
+#undef CAPTURE_STUB_B
+_Static_assert(sizeof g_capture_stub / 4 == 33, "the literal offsets in the stub words assume 33 words");
+static void patch_capture_res(Module *m) {
+    if (ios_code()) return;
+    const char *e = getenv("TOTK_CAPTURE_RES");
+    if (e && !strcmp(e, "0")) { fprintf(stderr, "[botw] UI capture textures as shipped, 720p (TOTK_CAPTURE_RES=0)\n"); return; }
+    unsigned w, h; if (!runtime_output_res(&w, &h)) h = 1080;
+    if (h <= 720) return;
+    for (size_t i = 0; i < sizeof g_capture_check / sizeof *g_capture_check; i++) {
+        uint32_t word; memcpy(&word, m->base + g_capture_check[i].off, 4);
+        if (word != g_capture_check[i].original) {
+            fprintf(stderr, "[botw] UI capture main+%#x: found %08x expected %08x\n", g_capture_check[i].off, word, g_capture_check[i].original);
+            runtime_fail("sharp UI captures require the " TOTK_GAME_VERSION " capture instructions");
+        }
+    }
+    /* the patch area's tail after the typing-speed stub (patch_font_typing: 23 words at the 16-byte aligned file end) */
+    const uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL;
+    const uint64_t stub = ((m->file_size + 15) & ~15ULL) + 96;
+    int room = stub >= m->patch_off && stub + sizeof g_capture_stub <= data_off;
+    for (size_t i = 0; room && i < sizeof g_capture_stub; i++) room = !m->base[stub + i];
+    if (!room) {
+        fprintf(stderr, "[botw] UI capture textures: no free %zu bytes at main+%#llx: as shipped (720p)\n", sizeof g_capture_stub, (unsigned long long)stub);
+        return;
+    }
+    uint32_t words[sizeof g_capture_stub / 4];
+    memcpy(words, g_capture_stub, sizeof words);
+    const float k = (float)h / 720.0f;
+    memcpy(&words[CAPTURE_K], &k, 4);
+    const char *mw = getenv("TOTK_CAPTURE_MIN_W");
+    const float min_w = mw && *mw ? (float)atof(mw) : 150.0f;
+    memcpy(&words[CAPTURE_MIN_W], &min_w, 4);
+    put_words(m, stub, words, sizeof words / 4, "UI capture stubs");
+    put_word(m, CAPTURE_SITE_A, 0x80000000u | branch_to(CAPTURE_SITE_A, stub), "UI capture kept texture");   /* bl A */
+    put_word(m, CAPTURE_SITE_B, 0x80000000u | branch_to(CAPTURE_SITE_B, stub + 4 * CAPTURE_STUB_B_AT), "UI capture pass");   /* bl B */
+    put_word(m, CAPTURE_SITE_B + 4, 0xd503201fu, "UI capture pass");   /* nop: B did the second move */
+    fprintf(stderr, "[botw] UI capture textures x%.2f for the %u-pixel canvas (panes %.0f layout units wide or more and under a quarter screen; "
+            "stubs at main+%#llx; TOTK_CAPTURE_RES=0 keeps 720p)\n", k, h, min_w, (unsigned long long)stub);
+}
 #endif
 
 /* TOTK_PCHTXT=<file> (runtime/pchtxt.h, the reader both games share), 1.9.0 and 1.6.0 (1.6.0 untested: no 1.6.0 game
@@ -1139,6 +1450,7 @@ void runtime_game_patches(Module *m) {
     patch_fov(m);
 #endif
     patch_font_size(m);
+    patch_capture_res(m);   /* after patch_font_size: its stubs follow the typing-speed stub */
     botw_aspect_install(m);
     botw_vr_camera_install(m);
     botw_vr_projection_install(m);
@@ -1155,6 +1467,9 @@ void runtime_game_patches(Module *m) {
       } else fprintf(stderr, "[botw] exclusive loads as shipped (TOTK_EXCL_ACQUIRE=0)\n"); }
 #ifdef GAME_BOTW160
     { void cdpoint_arm(Module *m); cdpoint_arm(m); }   /* TOTK_CDPOINT_TRACE (below, with the other brk diagnostics) */
+#else
+    { void arrow_log_arm(Module *m); arrow_log_arm(m); }   /* TOTK_ARROW_LOG (below, with the other brk diagnostics) */
+    { void snd_log_arm(Module *m); snd_log_arm(m); }   /* TOTK_SOUND_FRAME_LOG (below, with the other brk diagnostics) */
 #endif
     const char *e = getenv("TOTK_JQ_CHECK"); if (!e || !*e || !strcmp(e, "0") || ios_code()) return;
     for (int i = 0; i < JQ_SITES; i++) { uint32_t w; memcpy(&w, m->base + g_jq_site[i].off, 4);
@@ -1457,7 +1772,75 @@ static int botw_cdp_hook(ucontext_t *u) {
     return 1;
 }
 #endif
+#ifdef GAME_BOTW190
+/* TOTK_ARROW_LOG=1 (diagnostics, an arrow's fall above 30 fps): the fall update of an arrow (main+0x5ee668, x20 = the
+   arrow) makes its velocity the last one's direction x its speed plus a gravity vector: the stored velocity at +0x110 is
+   in metres per console frame (x 30 for its body), the gravity's Y part comes from +0x108. A brk takes `fadd s9, s2, s1`
+   (main+0x5ee738), after the gravity's load: s1 is the gravity this update adds, s2 the vertical part of direction x
+   speed. One line per update: time, the arrow, the frame step's ratio, s1, s2 and the last velocity. */
+enum { ARROW_LOG_SITE = 0x5ee738 };
+static const uint32_t ARROW_LOG_WORD = 0x1e212849u;   /* fadd s9, s2, s1 */
+static uint8_t *g_arrow_main; static int g_arrow_on; static _Atomic uint64_t g_arrow_lines;
+void arrow_log_arm(Module *m) {
+    const char *e = getenv("TOTK_ARROW_LOG");
+    if (!e || !*e || !strcmp(e, "0") || ios_code()) return;
+    uint32_t w; memcpy(&w, m->base + ARROW_LOG_SITE, 4);
+    if (w != ARROW_LOG_WORD) { fprintf(stderr, "[botw] TOTK_ARROW_LOG: main+%#x is %08x, not %08x: not armed\n", ARROW_LOG_SITE, w, ARROW_LOG_WORD); return; }
+    uint32_t b = 0xd4200000u | (0x7c0u << 5); memcpy(m->base + ARROW_LOG_SITE, &b, 4);
+    g_arrow_main = m->base; g_arrow_on = 1;
+    fprintf(stderr, "[botw] TOTK_ARROW_LOG: each falling arrow's update is logged (main+%#x)\n", ARROW_LOG_SITE);
+}
+static int botw_arrow_hook(ucontext_t *u) {
+    float g, s2; memcpy(&g, &u->uc_mcontext->__ns.__v[1], 4); memcpy(&s2, &u->uc_mcontext->__ns.__v[2], 4);
+    const float s9 = s2 + g; __uint128_t v = 0; memcpy(&v, &s9, 4);
+    u->uc_mcontext->__ns.__v[9] = v; u->uc_mcontext->__ss.__pc += 4;   /* the instruction the brk took */
+    if (atomic_fetch_add(&g_arrow_lines, 1) >= 20000) return 1;
+    const uint64_t a = u->uc_mcontext->__ss.__x[20]; const float *vel = (const float *)(uintptr_t)(a + 0x110);
+    float ratio = 1; if (frame_step_data) { uint64_t bits = atomic_load(frame_step_data); memcpy(&ratio, &bits, 4); }
+    fprintf(stderr, "[arrow] %.4f arrow %#llx ratio %.4f gravity %.5f dir_y %.5f velocity %.5f %.5f %.5f\n",
+            clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-9, (unsigned long long)a, ratio, g, s2, vel[0], vel[1], vel[2]);
+    return 1;
+}
+/* TOTK_SOUND_FRAME_LOG=1 (diagnostics, the sound's clock above 30 fps): once a frame main+0x1550fcc hands the sound
+   system the VFR's delta frame (s0, from main+0x59c788), at least a floor (s1, 0.5 as shipped), in console frames: s8,
+   which steps the audio frame (main+0xf07808) and is stored at +0x84 of [main+0x1e37038]. A brk takes the select
+   `fcsel s8, s1, s0, mi` (main+0x155100c). Once a second of real time: frames, the game's delta and the sound's in
+   seconds (sum / 30) and their ratio to the real time, the delta's range, the floor and how many frames it set. */
+enum { SND_LOG_SITE = 0x155100c };
+static const uint32_t SND_LOG_WORD = 0x1e204c28u;   /* fcsel s8, s1, s0, mi */
+static uint8_t *g_snd_main; static int g_snd_on;
+void snd_log_arm(Module *m) {
+    const char *e = getenv("TOTK_SOUND_FRAME_LOG");
+    if (!e || !*e || !strcmp(e, "0") || ios_code()) return;
+    uint32_t w; memcpy(&w, m->base + SND_LOG_SITE, 4);
+    if (w != SND_LOG_WORD) { fprintf(stderr, "[botw] TOTK_SOUND_FRAME_LOG: main+%#x is %08x, not %08x: not armed\n", SND_LOG_SITE, w, SND_LOG_WORD); return; }
+    uint32_t b = 0xd4200000u | (0x7c1u << 5); memcpy(m->base + SND_LOG_SITE, &b, 4);
+    g_snd_main = m->base; g_snd_on = 1;
+    fprintf(stderr, "[botw] TOTK_SOUND_FRAME_LOG: the sound system's frame is summed each second (main+%#x)\n", SND_LOG_SITE);
+}
+static int botw_snd_hook(ucontext_t *u) {   /* one caller, the frame loop: plain statics */
+    static uint64_t t0; static unsigned frames, floored; static double game, sound; static float lo, hi, floor_lo, floor_hi;
+    float d, f; memcpy(&d, &u->uc_mcontext->__ns.__v[0], 4); memcpy(&f, &u->uc_mcontext->__ns.__v[1], 4);
+    const float s8 = d < f ? f : d;   /* mi after fcmp s0, s1: s0 < s1 (a NaN keeps s0, as the select does) */
+    __uint128_t v = 0; memcpy(&v, &s8, 4);
+    u->uc_mcontext->__ns.__v[8] = v; u->uc_mcontext->__ss.__pc += 4;   /* the instruction the brk took */
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!t0) { t0 = now; return 1; }
+    if (!frames) { lo = hi = d; floor_lo = floor_hi = f; }
+    frames++; floored += d < f; game += d / 30.0; sound += s8 / 30.0;
+    if (d < lo) lo = d; if (d > hi) hi = d; if (f < floor_lo) floor_lo = f; if (f > floor_hi) floor_hi = f;
+    const double real = (now - t0) * 1e-9;
+    if (real < 1.0) return 1;
+    fprintf(stderr, "[sound-frame] %.3f s real, %u frames: game %.3f s (x%.3f), sound %.3f s (x%.3f); delta %.4f-%.4f, floor %.4f-%.4f, floored %u\n",
+            real, frames, game, game / real, sound, sound / real, lo, hi, floor_lo, floor_hi, floored);
+    t0 = now; frames = floored = 0; game = sound = 0;
+    return 1;
+}
+#endif
 int botw_jq_hook(void *context) {   /* SIGTRAP from loader.c crash(): 1 = it was one of ours, handled */
+#ifdef GAME_BOTW190
+    if (g_arrow_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_arrow_main + ARROW_LOG_SITE) return botw_arrow_hook(context);
+#endif
 #ifdef GAME_BOTW160
     if (g_pad_log_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_pad_main + PAD_LOOP) return botw_pad_hook(context);
     if (g_cdp_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_cdp_main + CDP_SITE) return botw_cdp_hook(context);
@@ -1465,6 +1848,9 @@ int botw_jq_hook(void *context) {   /* SIGTRAP from loader.c crash(): 1 = it was
     if (g_cdp_heap_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_cdp_main + CDP_HEAP_SITE) return botw_cdp_heap_hook(context);
     if (g_cdp_blend_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_cdp_main + CDP_BLEND_SITE) return botw_cdp_blend_hook(context);
     if (g_cdp_cam_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_cdp_main + CDP_CAM_SITE) return botw_cdp_cam_hook(context);
+#endif
+#ifdef GAME_BOTW190
+    if (g_snd_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_snd_main + SND_LOG_SITE) return botw_snd_hook(context);
 #endif
     if (!g_jq_on) return 0;
     ucontext_t *u = context; uint64_t pc = u->uc_mcontext->__ss.__pc, *x = u->uc_mcontext->__ss.__x;
@@ -1731,10 +2117,22 @@ static void output_mfx_off(void) {   /* a start above 1080p turns MetalFX 2K off
     dm_gfx_set_flag("mfx_output", 0); dm_gfx_set_flag("mfx_upscale", 0);
 }
 #endif
+#ifndef GAME_BOTW160
+/* MetalFX on a canvas above 1080p is a picture mode only when that canvas is native + MetalFX's own (2560x1440,
+   runtime_output_native); MetalFX 2K scales the 1080p canvas. */
+static int output_mfx_canvas(void) {
+    uint64_t c = atomic_load(&g_out_cur);
+    unsigned w, h;
+    return (uint32_t)c <= 1920 ||
+           (runtime_output_native(OUTPUT_MODE_NATIVE_METALFX, &w, &h) && w == (uint32_t)c && h == (uint32_t)(c >> 32));
+}
+#endif
 /* At the first present: once the framework has made the swapchain from the static, the static follows the canvas (the
-   dungeon map and the noise gauge scale by it every call). On 1.9.0 a start above 1080p (1440p, screen, a fixed size)
-   also turns off MetalFX 2K, which TOTK_MFX_OUTPUT / TOTK_MFX_UPSCALE may have turned on, so the panel starts from the
-   native size (1.6.0 keeps upstream's start). */
+   dungeon map and the noise gauge scale by it every call). On 1.9.0 MetalFX, which TOTK_MFX_OUTPUT / TOTK_MFX_UPSCALE or
+   the saved picture mode may have turned on, stays on only when the canvas it scales belongs to a picture mode
+   (output_mfx_canvas): a start above 1080p from 1440p, the screen or a fixed size turns it off, so the panel starts from
+   the native size, and a saved "native 2K + MetalFX" (2560x1440) keeps it (#1806: the old "above 1920 wide" test predates
+   that mode and turned it off at every start). 1.6.0 keeps upstream's start. */
 static void botw_output_tick(void) {
 #ifdef GAME_BOTW160
     if(g_out_vr){runtime_vr_render_apply_pending();return;}
@@ -1744,7 +2142,7 @@ static void botw_output_tick(void) {
     done = 1;
     if (g_out_mode == OUT_AUTO) output_static();
 #ifndef GAME_BOTW160
-    if ((uint32_t)atomic_load(&g_out_cur) > 1920) output_mfx_off();
+    if (!output_mfx_canvas()) output_mfx_off();
 #endif
 }
 #ifdef GAME_BOTW160
@@ -1866,7 +2264,7 @@ static int patch_output_res(Module *m) {   /* 1.9.0: the swapchain and heaps at 
     for (int i = 0; i < 6; i++) memcpy(m->base + branch[i].off, &branch[i].word, 4);
     unsigned cw = (unsigned)atomic_load(&g_out_cur), ch = (unsigned)(atomic_load(&g_out_cur) >> 32);
     fprintf(stderr, "[botw] output: a %ux%u swapchain, starting at %ux%u; display heap %u MiB, GPU heap %u MiB, memory and root heaps +%u MiB (30 instructions verified)%s\n",
-            w, h, cw, ch, display, gpu, extra, g_out_mode != OUT_AUTO ? "" : native_5k_app() ? "; settings panel picture: off, MetalFX 2K, 720p, native 2K, native 2K + MetalFX, native 4K, native 5K" : native_4k_app() ? "; settings panel picture: off, MetalFX 2K, 720p, native 2K, native 2K + MetalFX, native 4K" :
+            w, h, cw, ch, display, gpu, extra, g_out_mode != OUT_AUTO ? "" : native_5k_app() ? "; settings panel picture: off, MetalFX 2K, 720p, native 2K, native 2K + MetalFX, native 4K, 4K + MetalFX to 5K, native 5K" : native_4k_app() ? "; settings panel picture: off, MetalFX 2K, 720p, native 2K, native 2K + MetalFX, native 4K, 4K + MetalFX to 5K" :
             w > 2560 ? "; settings panel picture: off, MetalFX 2K, 720p, native, native 2K + MetalFX" : "; settings panel picture: off, MetalFX 2K, 720p, native, native + MetalFX");
     return 1;
 }
@@ -1900,18 +2298,21 @@ int runtime_game_fps_limit(void) {
    on 1.9.0 also 1440p and screen) the panel also offers native: the canvas and the scene at the largest size of the
    session (output_switch; 2560x1440, or the screen size under TOTK_OUTPUT_RES=screen), and native + MetalFX: the
    2560x1440 canvas that MetalFX scales to the window (1.9.0 on a screen bigger than 2K: bog 2026-10-24, clean edges at 51
-   FPS, native 2K 50, the screen size 42-44). Both versions also offer 720p (the canvas and the scene at 1280x720).
+   FPS, native 2K 50, the screen size 42-44). Both versions also offer 720p (the canvas and the scene at 1280x720) and 720p + MetalFX (that canvas scaled to the window).
    Otherwise off and MetalFX 2K. */
 static int output_switchable(void) { return g_out_mode == OUT_AUTO && g_out_page; }
 static unsigned output_width_now(void) { return (unsigned)(atomic_load(&g_out_cur) & 0xffffffffu); }
 /* Native 4K (a native 4K app, native_4k_app): the 3840x2160 canvas; native and native + MetalFX are then 2K, as on Tears
-   of the Kingdom. */
+   of the Kingdom. 4K + MetalFX: the same 4K canvas that MetalFX scales to a fixed 5120x2880 with both of its other stages
+   off (Tears of the Kingdom 1.4.3's 4K to 5K); not in VR. 1.9.0's start rule (output_mfx_canvas) turns off only those
+   other stages, so this mode keeps its target. */
+static _Atomic int out_4k_mfx;   /* 4K + MetalFX: the graphics layer has its flag mfx_target, runtime_output_mode reads it back here */
 int runtime_output_native(int mode, unsigned *w, unsigned *h) {
     if(g_out_vr){if(mode!=OUTPUT_MODE_NATIVE)return 0;uint64_t c=runtime_output_size_current();*w=(unsigned)c;*h=(unsigned)(c>>32);return 1;}
     if (!output_switchable()) return 0;
     int app4k = g_out_w >= 3840 && g_out_h >= 2160 && native_4k_app();
     if (mode == OUTPUT_MODE_NATIVE_5K) { if (g_out_w < 5120 || g_out_h < 2880 || !native_5k_app()) return 0; *w = 5120; *h = 2880; return 1; }
-    if (mode == OUTPUT_MODE_NATIVE_4K) { if (!app4k) return 0; *w = 3840; *h = 2160; return 1; }
+    if (mode == OUTPUT_MODE_NATIVE_4K || mode == OUTPUT_MODE_4K_TO_5K_METALFX) { if (!app4k) return 0; *w = 3840; *h = 2160; return 1; }
     if (mode == OUTPUT_MODE_NATIVE && app4k) { *w = 2560; *h = 1440; return 1; }
     if (mode == OUTPUT_MODE_NATIVE) { *w = g_out_w; *h = g_out_h; return 1; }
     if (mode != OUTPUT_MODE_NATIVE_METALFX) return 0;
@@ -1926,9 +2327,12 @@ int runtime_output_native(int mode, unsigned *w, unsigned *h) {
 int runtime_output_modes(void) {
     if(g_out_vr)return 1<<OUTPUT_MODE_NATIVE;
     unsigned w, h;
-    return 1 << OUTPUT_MODE_OFF | 1 << OUTPUT_MODE_METALFX | (output_switchable() ? 1 << OUTPUT_MODE_720P : 0) |
+    return 1 << OUTPUT_MODE_OFF | 1 << OUTPUT_MODE_METALFX | (output_switchable() ? 1 << OUTPUT_MODE_720P | 1 << OUTPUT_MODE_720P_METALFX : 0) |
            (runtime_output_native(OUTPUT_MODE_NATIVE, &w, &h) ? 1 << OUTPUT_MODE_NATIVE | 1 << OUTPUT_MODE_NATIVE_METALFX : 0) |
            (runtime_output_native(OUTPUT_MODE_NATIVE_4K, &w, &h) ? 1 << OUTPUT_MODE_NATIVE_4K : 0) |
+#if TARGET_OS_OSX   /* 4K + MetalFX to 5K: Mac only, as 1.4.3's picture_4k_to_5k_available */
+           (runtime_output_native(OUTPUT_MODE_4K_TO_5K_METALFX, &w, &h) ? 1 << OUTPUT_MODE_4K_TO_5K_METALFX : 0) |
+#endif
            (runtime_output_native(OUTPUT_MODE_NATIVE_5K, &w, &h) ? 1 << OUTPUT_MODE_NATIVE_5K : 0);
 }
 int runtime_output_mode(void) {
@@ -1936,8 +2340,9 @@ int runtime_output_mode(void) {
     extern int mfxup_enabled(void);
     if (output_switchable()) {
         unsigned w = output_width_now();
-        if (w == 1280) return OUTPUT_MODE_720P;
+        if (w == 1280) return mfxup_enabled() ? OUTPUT_MODE_720P_METALFX : OUTPUT_MODE_720P;
         if (w == 5120 && native_5k_app() && !mfxup_enabled()) return OUTPUT_MODE_NATIVE_5K;
+        if (w == 3840 && out_4k_mfx) return OUTPUT_MODE_4K_TO_5K_METALFX;
         if (w >= 3840 && native_4k_app() && !mfxup_enabled()) return OUTPUT_MODE_NATIVE_4K;
         if (w > 1920) return mfxup_enabled() ? OUTPUT_MODE_NATIVE_METALFX : OUTPUT_MODE_NATIVE;
     }
@@ -1946,16 +2351,18 @@ int runtime_output_mode(void) {
 int runtime_output_mode_set(int mode) {
     extern void dm_gfx_set_flag(const char *name, int value);
     if(g_out_vr)return 0; /* Desktop saved modes/key 3 cannot change a VR eye allocation. */
-    if (mode < OUTPUT_MODE_OFF || mode > OUTPUT_MODE_NATIVE_5K || !(runtime_output_modes() & 1 << mode)) return 0;
-    int mfx = mode == OUTPUT_MODE_METALFX || mode == OUTPUT_MODE_NATIVE_METALFX;   /* native + MetalFX: the output stage scales the 2K canvas to the window */
+    if (mode < OUTPUT_MODE_OFF || mode > OUTPUT_MODE_LAST || !(runtime_output_modes() & 1 << mode)) return 0;
+    int mfx = mode == OUTPUT_MODE_METALFX || mode == OUTPUT_MODE_NATIVE_METALFX || mode == OUTPUT_MODE_720P_METALFX;   /* native + MetalFX: the output stage scales the 2K canvas to the window */
     dm_gfx_set_flag("mfx_output", mfx);
     dm_gfx_set_flag("mfx_upscale", mfx);
+    out_4k_mfx = mode == OUTPUT_MODE_4K_TO_5K_METALFX;
+    dm_gfx_set_flag("mfx_target", out_4k_mfx ? (int)mfx_target_pack(5120, 2880) : 0);
     if (output_switchable()) {
         unsigned w = 1920, h = 1080;
-        if (mode == OUTPUT_MODE_720P) { w = 1280; h = 720; } else if (mode == OUTPUT_MODE_NATIVE || mode == OUTPUT_MODE_NATIVE_METALFX || mode == OUTPUT_MODE_NATIVE_4K || mode == OUTPUT_MODE_NATIVE_5K) runtime_output_native(mode, &w, &h);
+        if (mode == OUTPUT_MODE_720P || mode == OUTPUT_MODE_720P_METALFX) { w = 1280; h = 720; } else if (mode == OUTPUT_MODE_NATIVE || mode == OUTPUT_MODE_NATIVE_METALFX || mode == OUTPUT_MODE_NATIVE_4K || mode == OUTPUT_MODE_4K_TO_5K_METALFX || mode == OUTPUT_MODE_NATIVE_5K) runtime_output_native(mode, &w, &h);
         if (output_width_now() != w) output_switch(w, h);
     }
-    fprintf(stderr, "[botw] picture: %s\n", mode == OUTPUT_MODE_NATIVE_5K ? "native 5K" : mode == OUTPUT_MODE_NATIVE_4K ? "native 4K" : mode == OUTPUT_MODE_NATIVE ? "native" : mode == OUTPUT_MODE_NATIVE_METALFX ? "native 2K, MetalFX to the window" : mode == OUTPUT_MODE_720P ? "720p" :
+    fprintf(stderr, "[botw] picture: %s\n", mode == OUTPUT_MODE_NATIVE_5K ? "native 5K" : mode == OUTPUT_MODE_4K_TO_5K_METALFX ? "4K, MetalFX to 5K" : mode == OUTPUT_MODE_NATIVE_4K ? "native 4K" : mode == OUTPUT_MODE_NATIVE ? "native" : mode == OUTPUT_MODE_NATIVE_METALFX ? "native 2K, MetalFX to the window" : mode == OUTPUT_MODE_720P_METALFX ? "720p, MetalFX to the window" : mode == OUTPUT_MODE_720P ? "720p" :
             mode == OUTPUT_MODE_METALFX ? "MetalFX 2K" : "off (1080p)");
     return 1;
 }

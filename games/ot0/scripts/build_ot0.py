@@ -13,11 +13,14 @@ from pathlib import Path
 OT0 = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OT0 / 'scripts'))
 import versions
+if str(OT0.parents[1]) not in sys.path:   # the repository root, after this folder's own modules
+    sys.path.append(str(OT0.parents[1]))
+from tools.port_app.make_path import make_path  # noqa: E402  every port's make WORK= (issue #2284)
 
 APP_NAME = 'Octopath Traveler 0'
 MODULES = ('sdk', 'subsdk0', 'main')
 REWRITE_FILES = ('patched.bin', 'fixups.tsv', 'gates.tsv', 'cuts.tsv', 'obs.tsv', 'params.tsv', 'sites.tsv')
-LIBRARIES = {'opus': 'lib/libopus.a', 'libvpx': 'lib/libvpx.a'}
+DEPS = ('opus', 'libvpx')   # linked statically by the Makefile (tools/deps)
 APP_FILESYSTEMS = ('apfs', 'hfs')
 WORK_UNSAFE = ':$"'
 MAKE_UNSAFE = '$"'
@@ -44,6 +47,17 @@ Game data stays in the work folder and in the app; never share either. Saves, th
 
 class BuildError(Exception):
     pass
+
+
+def pinned_deps(*names):
+    """OPUS_PREFIX, VPX_PREFIX, … in this process's environment, which the Makefile reads: the repository's tools/deps
+    makes them once per Mac from pinned sources, so no Homebrew is needed (2026-11-12)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from tools.deps import DepsError, env
+    try:
+        os.environ.update(env(*names))
+    except DepsError as e:
+        raise BuildError(str(e)) from None
 
 
 def say(message):
@@ -95,9 +109,7 @@ def check_setup(work, out, inputs):
         raise BuildError(f'needs Python 3.14 (this is {sys.version.split()[0]}): start the build with python3.14')
     if subprocess.run(['xcrun', '--find', 'clang'], capture_output=True).returncode:
         raise BuildError("Xcode's Command Line Tools are missing: run xcode-select --install")
-    missing = [name for name, lib in LIBRARIES.items() if not (Path('/opt/homebrew/opt') / name / lib).is_file()]
-    if missing:
-        raise BuildError(f'missing Homebrew packages: run brew install {" ".join(missing)}')
+    pinned_deps(*DEPS)
     bad = unsafe(work, WORK_UNSAFE, spaces=True)
     if bad:
         raise BuildError(f'the work folder\'s path has {" ".join(repr(c) for c in bad)}, which make cannot handle: {work}\n'
@@ -236,7 +248,7 @@ def main(argv):
     data(py, game, update, keys, work, version, logs)
     rewrite(py, work, version, logs)
 
-    make = ['make', f'WORK={work}', f'VERSION={version}', f'PY={py}']
+    make = ['make', f'WORK={make_path(work, "ot0")}', f'VERSION={version}', f'PY={py}']
     say('4/5 runtime: building the runtime and the shader tools')
     run([*make, 'prepare'], logs / 'prepare.log')
     run([*make, '-j8', 'runtime', 'shader-tools'], logs / 'runtime.log')

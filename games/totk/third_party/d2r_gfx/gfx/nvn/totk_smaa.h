@@ -1,9 +1,9 @@
-/* Optional SMAA 1x on TOTK's tone-mapped scene, before its upscale and UI. Included by totk_finish.h.
+/* Optional SMAA 1x on the tone-mapped scene, before its upscale and UI (TOTK 1.4.3: totk_finish.h; BotW 1.9.0: botw_finish.h). Included by totk_finish.h.
    The caller closes the game's encoders first. These passes use their own pipelines, textures and argument tables;
    no NVN state is changed. Failure leaves the caller a texel-for-texel fallback rather than an unwritten FXAA image. */
 #include "totk_smaa_config.h"
 #include <string.h>
-#if TARGET_OS_OSX && !defined(GAME_BOTW)
+#if TARGET_OS_OSX && (!defined(GAME_BOTW) || defined(GAME_BOTW190))   /* BotW 1.9.0: botw_finish.h */
 #include "totk_spatial_aa_options.h"
 #include "../../../smaa/AreaTex.h"
 #include "../../../smaa/SearchTex.h"
@@ -24,14 +24,14 @@ static id<MTLRenderPipelineState> smaa_ps(int fn, MTLPixelFormat format) {
     for (int i = 0; i < g_smaa.nps; i++) if (g_smaa.ps[i].fn == fn && g_smaa.ps[i].format == format) return g_smaa.ps[i].state;
     if (g_smaa.failed || g_smaa.nps == 12) return nil;
     NSError *err = nil;
-    if (!g_smaa.lib) g_smaa.lib = [g_dev newLibraryWithSource:@(totk_smaa_msl) options:spatial_aa_compile_options() error:&err];
+    if (!g_smaa.lib) g_smaa.lib = mtl_counted_library(g_dev, @(totk_smaa_msl), spatial_aa_compile_options(), &err);
     if (!g_smaa.lib) { MLOG("[smaa] shader build failed: %s; keeping the scene", err.localizedDescription.UTF8String); g_smaa.failed = 1; return nil; }
     static NSString *const names[] = {@"smaa_edge", @"smaa_weight", @"smaa_blend"};
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [g_smaa.lib newFunctionWithName:@"smaa_vs"];
     d.fragmentFunction = [g_smaa.lib newFunctionWithName:names[fn]];
     d.colorAttachments[0].pixelFormat = format;
-    id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithDescriptor:d error:&err];
+    id<MTLRenderPipelineState> p = mtl_counted_render(g_dev, d, &err);
     if (!p) { MLOG("[smaa] pipeline failed: %s; keeping the scene", err.localizedDescription.UTF8String); g_smaa.failed = 1; return nil; }
     int i = g_smaa.nps++; g_smaa.ps[i].fn = fn; g_smaa.ps[i].format = format; g_smaa.ps[i].state = p;
     return p;

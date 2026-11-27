@@ -34,6 +34,9 @@ import time
 from pathlib import Path
 
 GAME_DIR = Path(__file__).resolve().parents[1]
+if str(GAME_DIR.parents[1]) not in sys.path:   # the repository root, after this folder's own modules
+    sys.path.append(str(GAME_DIR.parents[1]))
+from tools.port_app.make_path import make_path  # noqa: E402  every port's make WORK= (issue #2284)
 EXPECTED = json.loads((GAME_DIR / 'assets/expected-v1.0.0.json').read_text())
 FILES = EXPECTED['files']
 TITLE_ID = '01004D300C5AE000'
@@ -43,7 +46,7 @@ SPIRV_CROSS_SOURCES = ('main.cpp', 'spirv_cfg.cpp', 'spirv_cpp.cpp', 'spirv_cros
                        'spirv_cross_util.cpp', 'spirv_glsl.cpp', 'spirv_hlsl.cpp', 'spirv_msl.cpp', 'spirv_parser.cpp',
                        'spirv_reflect.cpp')
 SPIRV_CROSS_FLAGS = ('-O3', '-DNDEBUG', '-std=c++11', '-arch', 'arm64', '-Wno-deprecated-declarations')
-HOMEBREW = ('opus', 'libvpx')   # linked statically by the Makefile
+DEPS = ('opus', 'libvpx')   # linked statically by the Makefile (tools/deps)
 
 
 class BuildError(Exception):
@@ -117,10 +120,19 @@ def git_fetch(url, commit, dst, log):
     run(['git', '-C', dst, 'checkout', '-q', 'FETCH_HEAD'], log)
 
 
+def pinned_deps(*names):
+    """OPUS_PREFIX, VPX_PREFIX, … in this process's environment, which the Makefile reads: the repository's tools/deps
+    makes them once per Mac from pinned sources, so no Homebrew is needed (2026-11-12)."""
+    sys.path.insert(0, str(GAME_DIR.parents[1]))
+    from tools.deps import DepsError, env
+    try:
+        os.environ.update(env(*names))
+    except DepsError as e:
+        raise BuildError(str(e)) from None
+
+
 def prepare_tools(work, python, logs):
-    missing = [name for name in HOMEBREW if not Path(f'/opt/homebrew/opt/{name}/lib').is_dir()]
-    if missing:
-        raise BuildError(f'missing Homebrew packages: brew install {" ".join(missing)}')
+    pinned_deps(*DEPS)
     venv = work / '.venv'
     if not (venv / 'bin/python').exists():
         say('1. Python environment for the build tools')
@@ -227,7 +239,7 @@ def step_binary(work, py, game, keys, logs):
     translator = work / 'build/shader-service/totk_xlate'
     translator.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(GAME_DIR / 'prebuilt/macos-arm64/totk_xlate', translator)
-    run(['make', f'-j{os.cpu_count() or 4}', f'WORK={work}'], logs / 'runtime.log')
+    run(['make', f'-j{os.cpu_count() or 4}', f'WORK={make_path(work, "kirby")}'], logs / 'runtime.log')
     icon = work / 'build/AppIcon.icns'
     if not icon.exists():   # the game's own icon from its control data; optional
         try:

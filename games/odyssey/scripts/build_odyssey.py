@@ -27,6 +27,9 @@ from pathlib import Path
 
 GAME_DIR = Path(__file__).resolve().parents[1]
 GAMES = GAME_DIR.parent
+if str(GAME_DIR.parents[1]) not in sys.path:   # the repository root, after this folder's own modules
+    sys.path.append(str(GAME_DIR.parents[1]))
+from tools.port_app.make_path import make_path  # noqa: E402  every port's make WORK= (issue #2284)
 SPIRV_CROSS = ("https://github.com/KhronosGroup/SPIRV-Cross.git", "aa217aeb6c9f0ace7a0ab233b28807edf45eb165")
 MODULES = ("main", "sdk", "subsdk0")
 
@@ -59,9 +62,13 @@ def preflight(args, py):
     for name in ("capstone", "cryptography", "lz4"):
         if subprocess.run([py, "-c", f"import {name}"], capture_output=True).returncode:
             problems.append(f"Python module {name} is missing ({py} -m pip install capstone cryptography lz4)")
-    for lib in ("/opt/homebrew/opt/opus/lib/libopus.a", "/opt/homebrew/opt/libvpx/lib/libvpx.a"):
-        if not Path(lib).exists():
-            problems.append(f"{lib} is missing (brew install opus libvpx)")
+    # opus and libvpx: the repository's tools/deps makes them once per Mac from pinned sources (no Homebrew)
+    sys.path.insert(0, str(GAME_DIR.parents[1]))
+    from tools.deps import DepsError, env
+    try:
+        os.environ.update(env("opus", "libvpx"))
+    except DepsError as e:
+        problems.append(str(e))
     if not Path(args.developer_dir, "usr/bin/xcodebuild").exists():
         # The one-command build itself only needs clang and the SDK, and the command line
         # tools have both. Without Xcode's metal compiler precompile_cached_shaders.py fails
@@ -71,8 +78,10 @@ def preflight(args, py):
     for path in (args.game, args.keys):
         if not path.is_file():
             problems.append(f"{path} not found")
-    if args.game.suffix.lower() == ".nsp" and not args.firmware:
-        problems.append("an NSP carries no system fonts: pass --firmware <unpacked firmware NCA directory>")
+    fonts = args.work / "extracted/firmware/shared-fonts"
+    has_shared_fonts = len(list(fonts.glob("*.bfttf"))) >= 6
+    if args.game.suffix.lower() == ".nsp" and not args.firmware and not has_shared_fonts:
+        problems.append("an NSP carries no system fonts: provide six shared-font BFTTF files or pass --firmware")
     # About 12 GB in all; the merged RomFS (5.6 GB) is most of it, so a resumed build needs less.
     need = 5 if (args.work / "extracted/local/romfs/index.json").is_file() else 12
     free = shutil.disk_usage(args.work.parent if not args.work.exists() else args.work).free / 2**30
@@ -174,16 +183,22 @@ def main():
     done(t)
 
     t = step(6, "Shader tools and the runtime")
-    src = work / "src/SPIRV-Cross"
-    if not (src / ".git").is_dir():
-        run(["git", "clone", "--quiet", SPIRV_CROSS[0], src])
-    run(["git", "-C", src, "checkout", "--quiet", SPIRV_CROSS[1]])
-    # make cannot handle spaces in target paths, so the work folder goes in relative to games/odyssey (the checkout
-    # itself may sit in a folder with a space, as long as the work folder's own path below it has none).
-    make_work = os.path.relpath(work, GAME_DIR)
-    if " " in make_work:
-        raise SystemExit(f"make cannot build into a folder whose path has a space: {make_work}; pick another --work")
-    run(["make", f"-j{args.jobs}", "runtime", f"WORK={make_work}", f"PY={py}"], env={"DEVELOPER_DIR": args.developer_dir})
+    # the release's spirv-cross (tools/prebuilt.py: build_app.build_spirv_cross, the same commit, sources and flags as
+    # the Makefile's rules; user 2026-11-22: a player compiles nothing): no sources fetched, PREBUILT_SPIRV_CROSS=1
+    sys.path.insert(0, str(GAME_DIR.parents[1]))
+    import tools.prebuilt as prebuilt
+    placed = prebuilt.keep_placed(GAME_DIR.parents[1], "spirv-cross", work / "build/spirv-cross/spirv-cross")
+    if not placed:
+        prebuilt.compiler_needed("SPIRV-Cross")
+        src = work / "src/SPIRV-Cross"
+        if not (src / ".git").is_dir():
+            run(["git", "clone", "--quiet", SPIRV_CROSS[0], src])
+        run(["git", "-C", src, "checkout", "--quiet", SPIRV_CROSS[1]])
+    # make cannot handle spaces in target paths: the work folder goes in relative to games/odyssey (the checkout itself
+    # may sit in a folder with a space), and a work folder with a space through make_path's link without one.
+    make_work = os.path.relpath(make_path(work, "odyssey"), GAME_DIR)
+    run(["make", f"-j{args.jobs}", "runtime", f"WORK={make_work}", f"PY={py}", *(["PREBUILT_SPIRV_CROSS=1"] if placed else [])],
+        env={"DEVELOPER_DIR": args.developer_dir})
     done(t)
 
     seed = work / "build/shader-seed"
@@ -220,7 +235,7 @@ def main():
         run([py, "scripts/extract_app_icon.py", args.game, *keyargs, "--output", icon])
     run([py, "scripts/package_native_app.py"], env={"ODYSSEY_WORK": str(work)})
     done(t)
-    print(f"\nBuilt {work / 'Odyssey.app'} in {(time.monotonic() - started) / 60:.0f} min. It contains game data from your "
+    print(f"\nBuilt {os.environ.get('ODYSSEY_APP') or work / 'Odyssey.app'} in {(time.monotonic() - started) / 60:.0f} min. It contains game data from your "
           "own dump: do not share it.")
 
 

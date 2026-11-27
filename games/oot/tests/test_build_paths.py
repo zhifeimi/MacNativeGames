@@ -1,5 +1,6 @@
 """#2045: a work folder whose path has spaces (the default sits next to the dump, named after the game) still builds the
 runtime; #2055: the app records what the Update page needs (the checkout, the work folder, the Python, the commit)."""
+import re
 import importlib.util
 import os
 from pathlib import Path
@@ -17,12 +18,12 @@ class WorkPathTests(unittest.TestCase):
     def test_a_path_with_spaces_gets_an_alias_without_them(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp) / 'The Legend of Zelda Ocarina of Time [NUP]' / 'OcarinaOfTime_build'; work.mkdir(parents=True)
-            alias = build.make_path(work)
+            alias = build.make_path(work, 'oot')   # tools/port_app/make_path.py since issue #2284
             self.assertNotIn(' ', str(alias))
             self.assertEqual(alias.resolve(), work.resolve())
-            self.assertEqual(build.make_path(work), alias)   # the same alias each time
+            self.assertEqual(build.make_path(work, 'oot'), alias)   # the same alias each time
             plain = Path(tmp) / 'plain'; plain.mkdir()
-            self.assertEqual(build.make_path(plain), plain)
+            self.assertEqual(build.make_path(plain, 'oot'), plain)
 
     def test_make_refuses_a_work_path_with_spaces_and_says_why(self):
         result = subprocess.run(['make', '-n', '-C', str(GAME), 'WORK=/tmp/a b'], capture_output=True, text=True)
@@ -31,7 +32,7 @@ class WorkPathTests(unittest.TestCase):
 
     def test_both_runtime_builds_use_the_alias(self):
         source = (GAME / 'build.py').read_text()
-        self.assertEqual(source.count("'WORK='+str(make_path(work))"), 2)
+        self.assertEqual(source.count("'WORK='+str(make_path(work,'oot'))"), 2)
         self.assertNotIn("'WORK='+str(work)", source)
 
 
@@ -62,17 +63,20 @@ class AppRunningTests(unittest.TestCase):
 
 
 class ToolCheckTests(unittest.TestCase):
-    """#2070 (the reporter's M5 build): without ffmpeg the build ran for minutes and stopped at the opening overlay, the
-    last step, in a traceback; the build checks it first, as it checks LLVM (PR #2060)."""
-    SOURCE = (GAME / 'build.py').read_text()
+    """#2070 (the reporter's M5 build): without ffmpeg the build ran for minutes and stopped at the opening overlay. Since
+    fa394da8 (2026-11-12) the overlay cuts its clip in Python (scripts/webm_one_frame.py, the same bytes as ffmpeg's
+    remux), so there is no tool to check: the build and the overlay must not run ffmpeg or ffprobe again."""
+    RUNS_FFMPEG = re.compile(r"""['"](ffmpeg|ffprobe)['"]""")
 
-    def test_ffmpeg_is_checked_before_the_game_is_imported(self):
-        body = self.SOURCE[self.SOURCE.index('def build(args, source):'):]
-        self.assertLess(body.index("missing_tools(('ffmpeg','ffprobe'))"), body.index("'import-original-nup'"))
+    def test_the_build_and_the_opening_overlay_run_no_ffmpeg(self):
+        for name in ('build.py', 'scripts/make_opening_overlay.py', 'scripts/webm_one_frame.py'):
+            with self.subTest(name=name):
+                self.assertIsNone(self.RUNS_FFMPEG.search((GAME / name).read_text()))
 
-    def test_missing_tools_names_what_is_absent(self):
-        with mock.patch.object(build.shutil, 'which', lambda name, path=None: None if name == 'ffprobe' else '/x/' + name):
-            self.assertEqual(build.missing_tools(('ffmpeg', 'ffprobe')), ['ffprobe'])
+    def test_the_opening_overlay_cuts_its_clip_in_python(self):
+        overlay = (GAME / 'scripts/make_opening_overlay.py').read_text()
+        self.assertIn('import webm_one_frame', overlay)
+        self.assertIn('webm_one_frame.one_frame(', overlay)
 
 
 class UpdateInfoTests(unittest.TestCase):

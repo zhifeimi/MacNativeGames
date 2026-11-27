@@ -1,3 +1,8 @@
+# opus, libvpx and dav1d (the AV1 fallback): build_app.py passes these (codec_libraries); a make by hand asks the
+# repository's tools/deps, which makes them once per Mac from pinned sources (no Homebrew).
+OPUS_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix opus),$(error tools/deps could not make opus))
+VPX_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix libvpx),$(error tools/deps could not make libvpx))
+DAV1D_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix dav1d),$(error tools/deps could not make dav1d))
 # Isolated copy of our native Switch 2 runtime. Build artifacts stay in the caller's external workspace.
 WORK ?=
 ifeq ($(strip $(WORK)),)
@@ -12,16 +17,25 @@ NATIVE_OPT ?= -O2
 GAME_INFO := -Wl,-sectcreate,__TEXT,__info_plist,runtime/game_info.plist
 GFX_SRC := $(wildcard third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nvn/*.m third_party/d2r_gfx/gfx/nvn/*.S third_party/d2r_gfx/gfx/tex/*.c third_party/d2r_gfx/gfx/tex/*.m zeldaVR/gfx/*.c zeldaVR/gfx/*.m)
 GFX_OBJECTS := $(addprefix $(OUT)/obj/,$(addsuffix .o,$(GFX_SRC)))
-GFX_HEADERS := $(wildcard third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/*.inc third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h third_party/smaa/*.h zeldaVR/gfx/*.h zeldaVR/runtime/*.h)
-GFX_FLAGS := -std=gnu11 -Wno-error -Wno-unused-function -Wno-unused-parameter -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn/include -DGAME_OOT=1 -DGAME_NS2=1
+GFX_HEADERS := $(wildcard runtime/input_prompts.h runtime/prompt_bindings.h runtime/keyboard_map.h runtime/controller_map.h third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/*.inc third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h third_party/smaa/*.h zeldaVR/gfx/*.h zeldaVR/runtime/*.h)
+GFX_FLAGS := -std=gnu11 -Wno-error -Wno-unused-function -Wno-unused-parameter -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn/include -Iruntime -DGAME_OOT=1 -DGAME_NS2=1
 .DEFAULT_GOAL := runtime
 .PHONY: runtime
 $(OUT)/obj/%.o: % $(GFX_HEADERS) Makefile
 	@mkdir -p "$(dir $@)"
 	xcrun clang $(NATIVE_OPT) -g -Wall -Wextra $(GFX_FLAGS) -c "$<" -o "$@"
+# The game binary and its launcher run on macOS 26 whatever SDK builds them: with no minimum, clang and ld take the
+# SDK's version (Launcher 1.1.5, made on macOS 27, carried runtimes of minos 27.2 that macOS 26 refused, #2395). Set only on
+# these targets (make passes it to what they are made of): the translator and spirv-cross targets keep their own flags.
+$(OUT)/oot-native: export MACOSX_DEPLOYMENT_TARGET := 26.0
 $(OUT)/oot-native: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) $(GFX_OBJECTS) Makefile runtime/game_info.plist app/launcher.m
-	xcrun clang -std=c11 $(NATIVE_OPT) $(GAME_INFO) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DGAME_OOT=1 -DGAME_NS2=1 -I$(OUT) -I/opt/homebrew/opt/dav1d/include -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_data.c runtime/game_patches_ns2.c runtime/ns2_host.c runtime/ns2_codec.c runtime/hle_movie_av1.c runtime/ns2_audio_out.c runtime/ns2_opus_ms.c runtime/offline_host.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c app/launcher.m runtime/cloud_save.m $(GFX_OBJECTS) /opt/homebrew/opt/dav1d/lib/libdav1d.dylib /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework VideoToolbox -framework CoreMedia -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -framework IOSurface -o "$(OUT)/oot-native"
-runtime: $(OUT)/oot-native
+	xcrun clang -std=c11 $(NATIVE_OPT) $(GAME_INFO) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DGAME_OOT=1 -DGAME_NS2=1 -I$(OUT) -I$(DAV1D_PREFIX)/include -I$(OPUS_PREFIX)/include/opus -I$(VPX_PREFIX)/include runtime/loader.c runtime/game_data.c runtime/game_patches_ns2.c runtime/ns2_host.c runtime/ns2_codec.c runtime/hle_movie_av1.c runtime/ns2_audio_out.c runtime/audio_input.c runtime/audio_input_mac.m runtime/ns2_opus_ms.c runtime/offline_host.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c app/launcher.m runtime/cloud_save.m $(GFX_OBJECTS) $(DAV1D_PREFIX)/lib/libdav1d.a $(OPUS_PREFIX)/lib/libopus.a $(VPX_PREFIX)/lib/libvpx.a -framework VideoToolbox -framework CoreMedia -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework CoreAudio -framework AVFAudio -framework GameController -framework CoreHaptics -framework IOKit -framework IOSurface -o "$(OUT)/oot-native"
+runtime: $(OUT)/oot-native $(OUT)/pool-sources-list
+# build/pool_sources.tsv's maker (tools/pool_sources_list.m, 2026-11-18): the runtime's own pool proof and reflection
+# reader, built with every runtime so a list is always made by the code that reads it (build.py pool_list)
+$(OUT)/pool-sources-list: tools/pool_sources_list.m third_party/d2r_gfx/gfx/nvn/nvn_pool_sources.m third_party/d2r_gfx/gfx/nvn/nvn_pool_sources.h third_party/d2r_gfx/gfx/nvn/nvn_refl.m third_party/d2r_gfx/gfx/nvn/nvn_refl.h Makefile
+	@mkdir -p "$(dir $@)"
+	xcrun clang -std=gnu11 -O2 -g -Wall -Wextra -Werror -Wno-unused-parameter -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn -Ithird_party/d2r_gfx/gfx/nvn/include -DGAME_OOT=1 -DGAME_NS2=1 tools/pool_sources_list.m third_party/d2r_gfx/gfx/nvn/nvn_pool_sources.m third_party/d2r_gfx/gfx/nvn/nvn_refl.m -framework Foundation -framework Metal -o "$@"
 
 # The leaderboard's frame-rate record (fps_board.c): average, median, 1% low, highest, interpolated frames.
 $(OUT)/fps-board: tests/fps_board/probe.c third_party/d2r_gfx/gfx/nvn/fps_board.c third_party/d2r_gfx/gfx/nvn/fps_board.h
@@ -44,6 +58,14 @@ $(OUT)/gmem-index: tests/gmem_index.c third_party/d2r_gfx/gfx/nvn/nvn_gmem_index
 .PHONY: probe-gmem-index
 probe-gmem-index: $(OUT)/gmem-index
 	"$(OUT)/gmem-index"
+
+$(OUT)/ns2-movie-queue: tests/ns2_movie_queue.c runtime/ns2_codec.c runtime/ns2_movie_clock.h runtime/runtime.h runtime/thread_compat.h
+	@mkdir -p "$(OUT)"
+	xcrun clang -std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-unused-function -Wno-deprecated-declarations -fsanitize=address,undefined -fno-sanitize-recover=all -DGAME_OOT=1 -DGAME_NS2=1 -Ithird_party/d2r_gfx/gfx/nvn/include -I$(VPX_PREFIX)/include tests/ns2_movie_queue.c $(VPX_PREFIX)/lib/libvpx.a -o "$@"
+.PHONY: probe-movie-queue
+probe-movie-queue: $(OUT)/ns2-movie-queue
+	"$(OUT)/ns2-movie-queue"
+	"$(OUT)/ns2-movie-queue" off
 
 $(OUT)/timeline-owner: tests/timeline_owner.c third_party/d2r_gfx/gfx/nvn/totk_timeline.c third_party/d2r_gfx/gfx/nvn/totk_timeline.h
 	@mkdir -p "$(OUT)"

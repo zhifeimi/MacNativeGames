@@ -23,12 +23,14 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prepare_shader_seed import CHAIN, shader_key_scope, record_verified   # noqa: E402
+from ns2_shader_corpus import KEY_RULE, list_key_rule   # noqa: E402  (the key rule the seed's keys are made with; update_runtime.py checks it)
 
 VARIANTS = re.compile(r'^[0-9a-f]{64}\.variants$')
 VARIANT = re.compile(r'^[0-9a-f]{64}-[0-9a-f]{12}$')
@@ -42,6 +44,40 @@ def sha256(path):
     return h.hexdigest()
 
 
+MH_MAGIC_64, LC_SEGMENT_64, LC_CODE_SIGNATURE = 0xfeedfacf, 0x19, 0x1d
+
+
+def code_sha256(path):
+    """SHA-256 of a program's code, the same whatever signed it: a thin 64-bit Mach-O up to its code signature, with the
+    three sizes the signature sets zeroed (__LINKEDIT's vmsize and filesize, LC_CODE_SIGNATURE's datasize). MNG Launcher
+    ships this repository's translator signed with a Developer ID, whose signature carries a time stamp, so every release
+    is another file of the same code (2026-11-18: 9845718d ad-hoc here, 1113882b in the Launcher's 1.0.7 source; the
+    11-11 translator signed three times on 11-13: d9f3d149, 3f116d35, eb92d16e). Hashed whole, that made a Launcher build
+    and a command-line build of one work folder translate all 42,848 shaders again for each other, and every code update
+    do it for players. Anything else (no signature, another format) is hashed whole."""
+    data = bytearray(Path(path).read_bytes())
+    if len(data) < 32 or struct.unpack_from('<I', data, 0)[0] != MH_MAGIC_64:
+        return hashlib.sha256(data).hexdigest()
+    ncmds, sizeofcmds = struct.unpack_from('<II', data, 16)
+    at, end, sig = 32, 32 + sizeofcmds, None
+    for _ in range(ncmds):
+        if at + 8 > end:
+            return hashlib.sha256(data).hexdigest()
+        cmd, size = struct.unpack_from('<II', data, at)
+        if size < 8 or at + size > end:
+            return hashlib.sha256(data).hexdigest()
+        if cmd == LC_SEGMENT_64 and data[at + 8:at + 24].rstrip(b'\0') == b'__LINKEDIT':
+            struct.pack_into('<Q', data, at + 32, 0)   # vmsize
+            struct.pack_into('<Q', data, at + 48, 0)   # filesize
+        elif cmd == LC_CODE_SIGNATURE:
+            sig = struct.unpack_from('<I', data, at + 8)[0]
+            struct.pack_into('<I', data, at + 12, 0)   # datasize
+        at += size
+    if sig is None or sig > len(data):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return hashlib.sha256(bytes(data[:sig])).hexdigest()
+
+
 def translation_context(translator, depth_mode, spirv_cross=None):
     """The cache folder: what decides every translation at once, the chain, the device depth mode, the translator and the
     spirv-cross it runs (build/spirv-cross/spirv-cross; the runtime passes its path, totk_shader_rt.m service_start). Not the
@@ -52,10 +88,35 @@ def translation_context(translator, depth_mode, spirv_cross=None):
 
     The shader/bind-state key alone does not describe device depth mode. The old unversioned seed cache kept vertex
     shaders made with near=0 after the runtime was corrected to NVN's near=-w default.
+    The translator is its code (code_sha256), not its file: another signature is the same translator (schema 3, 2026-11-18).
     """
+    inputs = dict(schema=3, chain=CHAIN, depth_mode=depth_mode, translator_code_sha256=code_sha256(translator),
+                  spirv_cross_sha256=sha256(spirv_cross) if spirv_cross and Path(spirv_cross).is_file() else None)
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def legacy_translation_context(translator, depth_mode, spirv_cross=None):
+    """translation_context before 2026-11-18 (schema 2: the translator's whole file), to recognise caches made then."""
     inputs = dict(schema=2, chain=CHAIN, depth_mode=depth_mode, translator_sha256=sha256(translator),
                   spirv_cross_sha256=sha256(spirv_cross) if spirv_cross and Path(spirv_cross).is_file() else None)
     return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def adopt_legacy_cache(root, translator, depth_mode, spirv_cross, candidates):
+    """The cache folder of translation_context(translator) does not exist yet: take over the one made before schema 3 by
+    one of `candidates` (the program the last run translated with, build/shader-service/totk_xlate before it is replaced,
+    and this one) when it is the same code, so the change to code identity and a new signature translate nothing again.
+    Returns the folder taken over, or None."""
+    want, code = translation_context(translator, depth_mode, spirv_cross), code_sha256(translator)
+    if not root.is_dir() or (root / want).exists():
+        return None
+    for program in candidates:
+        if program.is_file() and code_sha256(program) == code:
+            old = root / legacy_translation_context(program, depth_mode, spirv_cross)
+            if old.is_dir():
+                old.rename(root / want)
+                return old
+    return None
 
 
 def run(cmd, log, env=None):
@@ -103,6 +164,20 @@ def parallel_sha256(paths):
 
 
 GENERATED = {'shader-keys.json', 'pso_title.tsv', 'pso_manifest.tsv'}   # written by the publish itself, from the inputs
+# Every shader the game ships (the corpus finds them all and keeps only those the list names), as shader_key_scope writes
+# it: which shaders are this game's, whatever this seed translated (shader-keys.json names only those). The shader merge
+# (games/totk/scripts/collect_shaders.py) reads it, so a row naming a shader outside it is never this game's (user
+# 2026-11-12: every game's shaders apart; Pokopia's seed named 8,291 of its 131,090 shaders). Not in the manifest: the
+# runtime takes the manifest's files only by its own names (totk_shader_seed.h) and never reads this one.
+IDENTITY = 'game-shader-keys.json'
+
+
+def write_identity(folder, identity):
+    """The game's shader keys into folder/IDENTITY, written only when they changed (the shader data bundle is signed again
+    when a file of the seed folder changes, build_app.shader_bundle)."""
+    path, text = folder / IDENTITY, json.dumps(identity, separators=(',', ':')) + '\n'
+    if not path.is_file() or path.read_text() != text:
+        path.write_text(text)
 
 
 def seed_unchanged(out, files, inputs):
@@ -118,11 +193,13 @@ def seed_unchanged(out, files, inputs):
         names = set(old.get('files', {}))
         if not set(files) <= names or not names - set(files) <= GENERATED:
             return False
-        for name, src in files.items():
+        def same(item):   # two stats a file, on all cores (2026-11-16: 117 us a stat on the external disk, 34 us with 16 threads)
+            name, src = item
             a, b = (out / name).stat(), src.stat()
-            if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
-                return False
-        return True
+            return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(min(16, (os.cpu_count() or 4) * 2)) as pool:
+            return all(pool.map(same, files.items(), chunksize=512))
     except (OSError, ValueError, AttributeError):
         return False
 
@@ -132,14 +209,14 @@ def seed_files(cache, verified=None):
     (the variants the seed run checked against its runtime's requests or made), only those, and indexes -> the entries left
     of each shader's index (written into the seed in place of the cache's file)."""
     files, indexes = {}, {}
-    for index in sorted(cache.glob('*.variants')):
-        if not VARIANTS.match(index.name):
-            continue
+    # Each index and its files on all cores, put together in the indexes' order as one thread did (2026-11-16: an index read
+    # took 649 us on the external disk, 73 us with 16 threads; scratch/runs/2026-11/express-speed/io-probe.log).
+    def one(index):
         try:
             entries = json.loads(index.read_text())
         except (OSError, ValueError):
-            continue
-        kept = []
+            return None
+        kept, found = [], []
         for entry in entries if isinstance(entries, list) else []:
             name = entry.get('variant') if isinstance(entry, dict) else None
             if not isinstance(name, str) or not VARIANT.match(name):
@@ -148,8 +225,19 @@ def seed_files(cache, verified=None):
                 continue
             metal, refl = cache / f'{name}_b.metal', cache / f'{name}_b.json'
             if metal.is_file() and refl.is_file():
-                files[metal.name], files[refl.name] = metal, refl
+                found.append((metal, refl))
                 kept.append(entry)
+        return entries, kept, found
+    import concurrent.futures
+    candidates = sorted(p for p in cache.glob('*.variants') if VARIANTS.match(p.name))
+    with concurrent.futures.ThreadPoolExecutor(min(16, (os.cpu_count() or 4) * 2)) as pool:
+        results = list(pool.map(one, candidates, chunksize=256))
+    for index, result in zip(candidates, results):
+        if result is None:
+            continue
+        entries, kept, found = result
+        for metal, refl in found:
+            files[metal.name], files[refl.name] = metal, refl
         if kept:
             files[index.name] = index
             if verified is not None and len(kept) != len(entries):
@@ -173,25 +261,40 @@ def main():
     a.logs.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     romfs_sha = json.loads((romfs / 'index.json').read_text())['romfs_sha256']
+    if list_key_rule(a.list) != KEY_RULE:   # its rows would name no shader of this seed
+        raise SystemExit(f'{a.list}: names its shaders by key rule {list_key_rule(a.list) or "(none said)"}, the seed by {KEY_RULE}: '
+                         'move it with ns2_rekey.py --apply first')
 
     stamp = corpus.with_suffix('.json')   # the corpus is made again only for other game files
+    all_keys = corpus.with_suffix('.keys.json')   # every shader the game ships (IDENTITY)
     want = {'romfs_sha256': romfs_sha, 'modules': {e.name: sha256(e) for e in sorted(elf.glob('*.elf'))},
             'tool': sha256(Path(__file__).resolve().parent / 'ns2_shader_corpus.py'), 'list': sha256(a.list)}
-    if not corpus.is_file() or not stamp.is_file() or json.loads(stamp.read_text()) != want:
+    # The add-on packs of this build (build_app.py step_aoc_ns2): their shaders are seeded too. Named in the stamp only when
+    # there are some, so a build without add-ons keeps the corpus it has.
+    addons = sorted(p.parent for p in Path(f'extracted/{v}/aoc').glob('*/index.json'))
+    if addons:
+        want['addons'] = {p.name: json.loads((p / 'index.json').read_text())['romfs_sha256'] for p in addons}
+    if not corpus.is_file() or not all_keys.is_file() or not stamp.is_file() or json.loads(stamp.read_text()) != want:
         corpus.parent.mkdir(parents=True, exist_ok=True)
         run([sys.executable, Path(__file__).resolve().parent / 'ns2_shader_corpus.py', '--romfs', romfs,
-             '--modules', *sorted(elf.glob('*.elf')), '--out', corpus, '--listed', a.list], a.logs / f'ns2-corpus-{v}.log')
+             *[x for p in addons for x in ('--extra-romfs', p)], '--modules', *sorted(elf.glob('*.elf')), '--out', corpus, '--listed', a.list, '--all-keys', all_keys],
+            a.logs / f'ns2-corpus-{v}.log')
         stamp.write_text(json.dumps(want))
 
     service = Path('build/shader-service/totk_xlate')   # where the runtime looks for the translator (totk_shader_rt.m)
     prebuilt = Path('prebuilt/macos-arm64/totk_xlate')
+    spirv_cross = Path('build/spirv-cross/spirv-cross')   # the one the runtime passes to the translator
+    # before the service copy is replaced: it is the program the last run translated with (2026-11-18, code identity)
+    adopted = adopt_legacy_cache(cache, prebuilt, a.depth_mode, spirv_cross, (service, prebuilt))
+    if adopted:
+        print(f'translation cache {adopted.name[:12]} taken over: the same translator code (another signature, or the cache '
+              f'was named by the whole file before 2026-11-18); nothing is translated again', flush=True)
     if not service.is_file() or sha256(service) != sha256(prebuilt):
         service.parent.mkdir(parents=True, exist_ok=True)
         # A new file, never written over the old one: macOS keeps the code signature it checked for a file it ran, and a
         # program overwritten in place is then killed at launch (SIGKILL, Code Signature Invalid; 2026-11-03).
         service.unlink(missing_ok=True)
         shutil.copy2(prebuilt, service)
-    spirv_cross = Path('build/spirv-cross/spirv-cross')   # the one the runtime passes to the translator
     context = translation_context(prebuilt, a.depth_mode, spirv_cross)
     cache = cache / context
     cache.mkdir(parents=True, exist_ok=True)
@@ -217,10 +320,14 @@ def main():
     keys = sorted(n[:-len('.variants')] for n in files if n.endswith('.variants'))
     shaders = sum(n.endswith('_b.metal') for n in files)
     here = Path(__file__).resolve().parent
-    inputs = dict(chain=CHAIN, version=v, source_romfs_sha256=romfs_sha, translation_context_sha256=context,
-                  nvn_depth_mode=a.depth_mode, translator_sha256=sha256(prebuilt), shader_list_sha256=sha256(a.list),
+    inputs = dict(chain=CHAIN, shader_key_rule=KEY_RULE, version=v, source_romfs_sha256=romfs_sha, translation_context_sha256=context,
+                  nvn_depth_mode=a.depth_mode, translator_sha256=sha256(prebuilt), translator_code_sha256=code_sha256(prebuilt), shader_list_sha256=sha256(a.list),
                   corpus_sha256=sha256(corpus), scripts_sha256={n: sha256(here / n) for n in ('prepare_ns2_seed.py', 'prepare_shader_seed.py')})
+    identity = shader_key_scope(json.loads(all_keys.read_text()), v, romfs_sha)
+    if not set(keys) <= set(identity['keys']):   # the seed translated only shaders the corpus found
+        raise SystemExit(f'{len(set(keys) - set(identity["keys"]))} translated shaders are not among the game\'s {len(identity["keys"])}')
     if not indexes and seed_unchanged(out, files, inputs):
+        write_identity(out, identity)
         print(f'seed unchanged: its {len(files)} translation files are the ones published, from the same inputs; '
               'kept as it is (no new links, digests or manifest)', flush=True)
         return
@@ -237,10 +344,10 @@ def main():
     # Unlike the shaders, a complete render-pipeline description needs the game's bind state. NS2 starts without
     # recorded pipeline rows; the shared list adds real rows as the game is played (never invent descriptors).
     (staging / 'pso_manifest.tsv').write_text('# NS2 startup shaders; render pipelines come from the shared list.\n')
-    report = dict(schema=1, chain=CHAIN, version=v, game=v, source_romfs_sha256=romfs_sha,
+    report = dict(schema=1, chain=CHAIN, shader_key_rule=KEY_RULE, version=v, game=v, source_romfs_sha256=romfs_sha,
                   translation_context_sha256=context,
                   nvn_depth_mode=a.depth_mode,
-                  translator_sha256=sha256(prebuilt), shader_list_sha256=sha256(a.list),
+                  translator_sha256=sha256(prebuilt), translator_code_sha256=code_sha256(prebuilt), shader_list_sha256=sha256(a.list),
                   preparation_sha256=sha256(Path(__file__).resolve()), shaders=shaders,
                   corpus_shaders=int(done.group(2)), translated_default=int(done.group(1)),
                   listed_variants=int(listed.group(1)) if listed else 0, listed_asked=int(listed.group(2)) if listed else 0,
@@ -248,6 +355,7 @@ def main():
     report['files'], read = publish_digests(sorted(staging.iterdir()), out, parallel_sha256)
     print(f'seed files: {len(report["files"])}, {read} read again (the rest kept the digest of the last seed)', flush=True)
     (staging / 'seed-manifest.json').write_text(json.dumps(report, indent=2) + '\n')
+    write_identity(staging, identity)   # after the manifest's digests: never one of its files
     # Publish first; deleting tens of thousands of old files on an external APFS volume takes minutes. The old seed
     # is entirely generated data and no longer read once its replacement is published.
     old = out.with_name(f'.{out.name}.old-{os.getpid()}-{time.time_ns()}')

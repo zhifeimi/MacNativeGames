@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Build an unsigned, sideloadable iPhone / iPad app of Metroid Dread 1.0.0 from a prepared work folder (games/Dread_build:
-the verified rewrite in rewritten/v100, the Mac runtime build/dread-native with its generated tables, the RomFS in
-extracted/v100/romfs, the prepared shader seed in build/shader-seed and the shaders the Mac translated in
+"""Build an unsigned, sideloadable iPhone / iPad app of Metroid Dread 2.1.0 from a prepared work folder (games/Dread_build:
+the verified rewrite in rewritten/v210, the Mac runtime build/dread-native with its generated tables, the RomFS in
+extracted/v210/romfs, the prepared shader seed in build/shader-seed and the shaders the Mac translated in
 build/shader-cache). Sign and install it with install_device.py.
 
   python3.14 games/dread/ios/tools/build_ipa.py --work games/Dread_build --out "games/Metroid Dread.ipa"
@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from xcode_dir import developer_dir
 
 GAME = Path(__file__).resolve().parents[2]   # games/dread
-VERSION = 'v100'
+VERSION = os.environ.get('DREAD_VERSION', 'v210')
 APP = 'Dread'   # the product name, Dread.app (install_device.py)
 
 def run(args, cwd, log, env):
@@ -52,6 +52,7 @@ targets:
         excludes:
           - Dread.entitlements
           - Info.plist
+      - path: {GAME/'ios/Settings.bundle'}   # the Settings app pane: the active players switch (mng_active.h)
       - path: {rt}
         excludes:
           - frontend.m
@@ -70,11 +71,15 @@ targets:
         CFBundleDisplayName: Metroid Dread
         CFBundleName: Metroid Dread
         CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
-        CFBundleShortVersionString: "1.0.0"
+        CFBundleShortVersionString: "{'1.0.0' if VERSION == 'v100' else '2.1.0'}"
         CFBundleVersion: "1"
         UILaunchScreen: {{}}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        CFBundleURLTypes:   # the iPhone MNG Launcher sees the game installed and starts it (tools/ios_launcher)
+          - CFBundleURLName: org.macnativegames.launch
+            CFBundleURLSchemes:
+              - mng-dread
         UIRequiresFullScreen: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationLandscapeLeft
@@ -111,7 +116,7 @@ targets:
         - {nvn/'nvn/include'}
         - {gen}
         - {gen/'deps/include'}
-      OTHER_CFLAGS: $(inherited) -mcpu=apple-a15 -I{rt} -I{nvn/'nvn'} -I{nvn/'nvn/include'} -I{gen} -I{work/'build'}
+      OTHER_CFLAGS: $(inherited) {'-DDREAD_V100=1' if VERSION == 'v100' else ''} -mcpu=apple-a15 -I{rt} -I{nvn/'nvn'} -I{nvn/'nvn/include'} -I{gen} -I{work/'build'}
 '''
 
 def main():
@@ -127,7 +132,9 @@ def main():
     ios = work/('build/ios-sim' if sim else 'build/ios'); gen = ios/'Gen'; logs = work/('logs/ios-sim' if sim else 'logs/ios'); gen.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, DEVELOPER_DIR=developer_dir())
     subprocess.run(['xcodebuild', '-version'], env=env, check=True, stdout=subprocess.DEVNULL)
-    if not shutil.which('xcodegen'): raise RuntimeError('install xcodegen: brew install xcodegen')
+    sys.path.insert(0, str(GAME.parents[1]))   # the repository's tools/deps: pinned xcodegen, cmake and ninja (no Homebrew)
+    from tools.deps import path as deps_path
+    env['PATH'] = os.pathsep.join(deps_path('xcodegen', 'cmake', 'ninja') + [env.get('PATH', '')])
     host, rewritten, romfs = work/'build/dread-native', work/f'rewritten/{VERSION}', work/f'extracted/{VERSION}/romfs'
     for need in (host, romfs/'romfs.bin', work/'build/runtime_tables.h'):
         if not need.exists(): raise RuntimeError(f'missing {need}: build the Mac app first (games/dread/build.py, or make prepare runtime)')
@@ -138,7 +145,7 @@ def main():
     flags = subprocess.check_output([sys.executable, GAME/'ios/tools/gen_embed.py', rewritten, gen/'embed.S', '--text-dir', modules,
                                      'main', 'subsdk0', 'sdk'], text=True, env=env).strip()
 
-    # Opus and libvpx for the device: Homebrew's Mac archives cannot be linked into an iOS app.
+    # Opus and libvpx for the device: the Mac archives (tools/deps) cannot be linked into an iOS app.
     deps = work/('build/ios-sim-deps' if sim else 'build/ios-deps')
     if not ((deps/'lib/libopus.a').is_file() and (deps/'lib/libvpx.a').is_file()):
         run([sys.executable, GAME/'ios/tools/build_deps.py', deps, sdk], work, logs/'dependencies.log', env)

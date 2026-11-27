@@ -135,6 +135,114 @@ class AdoptGameData(Base):
         self.assertIn('there is no signed game data bundle', self.said[-1])
 
 
+class SwitchTwoDumpIndex(unittest.TestCase):
+    """import_dump.py: an image taken from an installed app is indexed from the dump folder's listing with the rows pack()
+    writes, so a file is found at the same offset either way."""
+
+    def test_adopted_index_matches_the_packed_one(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('import_dump', Path(build_app.__file__).parent / 'games/totk/scripts/import_dump.py')
+        dump = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dump)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            folder = tmp / 'romfs'
+            for rel, data in (('a.bin', b'x' * 5), ('dir/b.bin', b'yy' * 9), ('dir/c/d.bin', b'z' * 33)):
+                (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+                (folder / rel).write_bytes(data)
+            packed = dump.pack(folder, tmp / 'packed')
+            report = json.loads((tmp / 'packed/index.json').read_text())
+            adopted = tmp / 'adopted'
+            adopted.mkdir()
+            (adopted / 'romfs.bin').write_bytes((tmp / 'packed/romfs.bin').read_bytes())
+            dump.index_adopted(folder, adopted, packed['sha256'], tmp / 'packed/romfs.bin')
+            again = json.loads((adopted / 'index.json').read_text())
+            self.assertEqual(again['files'], report['files'])
+            self.assertEqual((again['romfs_size'], again['romfs_sha256']), (report['romfs_size'], report['romfs_sha256']))
+            self.assertEqual([r['offset'] % 16 for r in again['files']], [0, 0, 0])
+            (folder / 'extra.bin').write_bytes(b'new')   # another folder: the image is not its pack
+            with self.assertRaises(SystemExit):
+                dump.index_adopted(folder, adopted, packed['sha256'], tmp / 'packed/romfs.bin')
+
+
+class OcarinaLibraryImage(unittest.TestCase):
+    """games/oot/scripts/import_dump.py adopt_image: an earlier pack of the dump, taken from the game library, gives the
+    index pack() writes, each file's SHA-256 read from the image (romfs_pin.py checks them), and refuses another image."""
+
+    def test_adopted_matches_packed(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('oot_import_dump', Path(build_app.__file__).parent / 'games/oot/scripts/import_dump.py')
+        dump = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dump)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            folder = tmp / 'romfs'
+            for rel, data in (('a.bin', b'x' * 5), ('d/b.bin', b'yy' * 9), ('d/e/c.bin', b'z' * 33)):
+                (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+                (folder / rel).write_bytes(data)
+            dump.pack(folder, tmp / 'packed')
+            library = tmp / 'library/oot/romfs.bin'
+            library.parent.mkdir(parents=True)
+            library.write_bytes((tmp / 'packed/romfs.bin').read_bytes())
+            dump.adopt_image(folder, tmp / 'adopted', library)
+            packed, adopted = (json.loads((tmp / f'{n}/index.json').read_text()) for n in ('packed', 'adopted'))
+            for key in ('files', 'directories', 'romfs_size', 'romfs_sha256'):
+                self.assertEqual(adopted[key], packed[key], key)
+            self.assertEqual(adopted['adopted_from'], str(library))
+            library.write_bytes(library.read_bytes() + b'!')   # not this folder's pack
+            with self.assertRaises(SystemExit):
+                dump.adopt_image(folder, tmp / 'again', library)
+
+
+class OcarinaLibraryChoice(unittest.TestCase):
+    """games/oot/build.py library_image: --mac-game-data-folder first, then the folder the replaced app records, then the
+    default game library; only a folder that holds oot/romfs.bin counts."""
+
+    def test_order(self):
+        import importlib.util, plistlib, types
+        spec = importlib.util.spec_from_file_location('oot_build_test', Path(build_app.__file__).parent / 'games/oot/build.py')
+        oot = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(oot)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            given, recorded, home = tmp / 'given', tmp / 'recorded', tmp / 'home'
+            for folder in (given, recorded):
+                (folder / 'oot').mkdir(parents=True)
+                (folder / 'oot/romfs.bin').write_bytes(b'x')
+            app = tmp / 'Ocarina of Time.app'
+            (app / 'Contents').mkdir(parents=True)
+            (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'MNGGameDataFolder': str(recorded)}))
+            with mock.patch.object(Path, 'home', return_value=home):
+                self.assertEqual(oot.library_image(types.SimpleNamespace(mac_game_data_folder=given), app), given / 'oot/romfs.bin')
+                self.assertEqual(oot.library_image(types.SimpleNamespace(mac_game_data_folder=None), app), recorded / 'oot/romfs.bin')
+                self.assertIsNone(oot.library_image(types.SimpleNamespace(mac_game_data_folder=None), tmp / 'none.app'))
+
+
+class FreshBaseRomFS(Base):
+    def test_step_data_checks_the_fresh_romfs_index(self):
+        romfs = self.tree / 'extracted/v0/romfs'
+        patches = romfs.parent / 'romfs-patches'
+        patches.mkdir(parents=True)
+        (patches / 'manifest.tsv').touch()
+        digest = EXPECTED['romfs']['sha256']
+
+        def extract(cmd, log, *, cwd):
+            self.assertEqual(cmd[1], 'scripts/extract_romfs.py')
+            self.assertEqual(cwd, self.tree)
+            romfs.mkdir()
+            (romfs / 'romfs.bin').write_bytes(IMAGE)
+            (romfs / 'index.json').write_text(json.dumps(dict(status='pass', romfs_sha256=digest)))
+
+        with mock.patch.object(build_app, 'EXPECTED', EXPECTED), \
+             mock.patch.object(build_app, 'fonts_valid', return_value=True), \
+             mock.patch.object(build_app, 'overlay_stale', return_value=None), \
+             mock.patch.object(build_app, 'run', side_effect=extract) as run, \
+             mock.patch.object(build_app, 'check', wraps=build_app.check) as check:
+            build_app.step_data(self.tree, self.root / 'game.xci', self.root / 'prod.keys', self.logs)
+        run.assert_called_once()
+        check.assert_called_once_with('RomFS', digest, digest)
+
+
 class UpdateBuildNeedsNoBaseImage(Base):
     def test_step_data_of_an_update_build_extracts_no_base_romfs(self):
         fonts = self.tree / 'extracted/firmware/shared-fonts'

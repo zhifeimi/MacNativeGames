@@ -8,6 +8,11 @@
 #   make boot      # run it from the work folder (cwd: extracted/ and rewritten/ are read relative to it)
 # VERSION picks the game version (v103, v104, v105); by default the newest one extracted in the work folder.
 
+# opus and libvpx come from the repository's tools/deps: made once per Mac from pinned sources (no Homebrew).
+# make runs here (games/<game>); set a *_PREFIX to use another build.
+OPUS_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix opus),$(error tools/deps could not make opus))
+VPX_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix libvpx),$(error tools/deps could not make libvpx))
+
 WORK ?= OT0_build
 OUT := $(WORK)/build
 VERSIONS := v103 v104 v105
@@ -41,10 +46,14 @@ $(OUT)/obj/%.o: % $(GFX_HEADERS) Makefile
 	@mkdir -p "$(dir $@)"
 	xcrun clang $(NATIVE_OPT) -g -Wall -Wextra $(GFX_FLAGS) -c "$<" -o "$@"
 
+# The game binary and its launcher run on macOS 26 whatever SDK builds them: with no minimum, clang and ld take the
+# SDK's version (Launcher 1.1.5, made on macOS 27, carried runtimes of minos 27.2 that macOS 26 refused, #2395). Set only on
+# these targets (make passes it to what they are made of): the translator and spirv-cross targets keep their own flags.
+$(OUT)/ot0-native-$(VERSION): export MACOSX_DEPLOYMENT_TARGET := 26.0
 $(OUT)/ot0-native-$(VERSION): $(RUNTIME_SRC) $(RUNTIME_HEADERS) $(GENERATED) $(GFX_OBJECTS) Makefile
 	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations $(VERSION_DEFINE) \
-	  -Ithird_party/d2r_gfx/gfx/nvn/include -I$(VOUT) -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include \
-	  $(RUNTIME_SRC) $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a \
+	  -Ithird_party/d2r_gfx/gfx/nvn/include -I$(VOUT) -I$(OPUS_PREFIX)/include/opus -I$(VPX_PREFIX)/include \
+	  $(RUNTIME_SRC) $(GFX_OBJECTS) $(OPUS_PREFIX)/lib/libopus.a $(VPX_PREFIX)/lib/libvpx.a \
 	  -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics \
 	  -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation \
 	  -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
@@ -98,6 +107,7 @@ APP ?= Octopath Traveler 0.app
 IN_APP = $(APP)/Contents/Resources/game
 GAME ?=
 KEYS ?=
+$(OUT)/launcher: export MACOSX_DEPLOYMENT_TARGET := 26.0
 $(OUT)/launcher: app/launcher.m Makefile
 	xcrun clang -std=gnu11 -O2 -Wall -Wextra -Werror -fobjc-arc app/launcher.m -framework Cocoa -o "$@"
 $(OUT)/AppIcon.icns:

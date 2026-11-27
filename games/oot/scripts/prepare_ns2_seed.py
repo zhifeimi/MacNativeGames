@@ -43,6 +43,40 @@ def sha256(path):
     return h.hexdigest()
 
 
+MH_MAGIC_64, LC_SEGMENT_64, LC_CODE_SIGNATURE = 0xfeedfacf, 0x19, 0x1d
+
+
+def code_sha256(path):
+    """SHA-256 of a program's code, the same whatever signed it: a thin 64-bit Mach-O up to its code signature, with the
+    three sizes the signature sets zeroed (__LINKEDIT's vmsize and filesize, LC_CODE_SIGNATURE's datasize). MNG Launcher
+    ships this repository's translator signed with a Developer ID, whose signature carries a time stamp, so every release
+    is another file of the same code (2026-11-18: 9845718d ad-hoc here, 1113882b in the Launcher's 1.0.7 source; the
+    11-11 translator signed three times on 11-13: d9f3d149, 3f116d35, eb92d16e). Hashed whole, that made a Launcher build
+    and a command-line build of one work folder translate all 42,848 shaders again for each other, and every code update
+    do it for players. Anything else (no signature, another format) is hashed whole."""
+    data = bytearray(Path(path).read_bytes())
+    if len(data) < 32 or struct.unpack_from('<I', data, 0)[0] != MH_MAGIC_64:
+        return hashlib.sha256(data).hexdigest()
+    ncmds, sizeofcmds = struct.unpack_from('<II', data, 16)
+    at, end, sig = 32, 32 + sizeofcmds, None
+    for _ in range(ncmds):
+        if at + 8 > end:
+            return hashlib.sha256(data).hexdigest()
+        cmd, size = struct.unpack_from('<II', data, at)
+        if size < 8 or at + size > end:
+            return hashlib.sha256(data).hexdigest()
+        if cmd == LC_SEGMENT_64 and data[at + 8:at + 24].rstrip(b'\0') == b'__LINKEDIT':
+            struct.pack_into('<Q', data, at + 32, 0)   # vmsize
+            struct.pack_into('<Q', data, at + 48, 0)   # filesize
+        elif cmd == LC_CODE_SIGNATURE:
+            sig = struct.unpack_from('<I', data, at + 8)[0]
+            struct.pack_into('<I', data, at + 12, 0)   # datasize
+        at += size
+    if sig is None or sig > len(data):
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return hashlib.sha256(bytes(data[:sig])).hexdigest()
+
+
 def translation_context(translator, depth_mode):
     """The cache folder: what decides every translation at once, the chain, the device depth mode and the translator (its
     spirv-cross runs inside it, TOTK_XLATE_SPIRV_CROSS=inproc). Not the runtime code that makes the requests: each
@@ -50,12 +84,40 @@ def translation_context(translator, depth_mode):
     seed run of another runtime keeps those it would ask for the same way and makes only the others again
     (TOTK_SEED_VERIFY, seed_verified; user 2026-11-11: "如何让 快速更新 不要这么容易失效"). Until then the source of the
     request functions counted, and removing a fallback for starting the translator (4b308d25) made all 42,891 translate again.
+    The translator is its code (code_sha256), not its file: another signature is the same translator (schema 4, 2026-11-18).
 
     The shader/bind-state key alone does not describe device depth mode. The old unversioned seed cache kept vertex
     shaders made with near=0 after the runtime was corrected to NVN's near=-w default.
     """
+    inputs = dict(schema=4, chain=CHAIN, depth_mode=depth_mode, translator_code_sha256=code_sha256(translator))
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def legacy_translation_context(translator, depth_mode):
+    """translation_context before 2026-11-18 (schema 3: the translator's whole file), to recognise the folders and seeds
+    made then (adopt_legacy_cache, games/oot/build.py seed_context_matches)."""
     inputs = dict(schema=3, chain=CHAIN, depth_mode=depth_mode, translator_sha256=sha256(translator))
     return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def adopt_legacy_cache(root, translator, depth_mode):
+    """The cache folder of translation_context(translator) does not exist yet: take over the newest folder made before
+    schema 4 by the same code, so the change to code identity (and a translator signed again) translates nothing again.
+    Each folder keeps the program it translated with (tool/build/shader-service/totk_xlate); one of the same code under
+    the old name of that program is renamed. Returns the folder taken over, or None."""
+    want, code = translation_context(translator, depth_mode), code_sha256(translator)
+    if (root / want).exists() or not root.is_dir():
+        return None
+    found = []
+    for folder in root.iterdir():
+        tool = folder / 'tool/build/shader-service/totk_xlate'
+        if folder.is_dir() and tool.is_file() and code_sha256(tool) == code and folder.name == legacy_translation_context(tool, depth_mode):
+            found.append(folder)
+    if not found:
+        return None
+    best = max(found, key=lambda f: f.stat().st_mtime)
+    best.rename(root / want)
+    return best
 
 
 def run(cmd, log, env=None):
@@ -117,11 +179,13 @@ def seed_unchanged(out, files, inputs):
         names = set(old.get('files', {}))
         if not set(files) <= names or not names - set(files) <= GENERATED:
             return False
-        for name, src in files.items():
+        def same(item):   # 128,668 files, two stats each: on all cores (2026-11-16, 117 us a stat on the external disk)
+            name, src = item
             a, b = (out / name).stat(), src.stat()
-            if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
-                return False
-        return True
+            return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(min(16, (os.cpu_count() or 4) * 2)) as pool:
+            return all(pool.map(same, files.items(), chunksize=512))
     except (OSError, ValueError, AttributeError):
         return False
 
@@ -131,14 +195,15 @@ def seed_files(cache, verified=None):
     (the variants the seed run checked against its runtime's requests or made), only those, and indexes -> the entries left
     of each shader's index (written into the seed in place of the cache's file)."""
     files, checks, indexes = {}, [], {}
-    for index in sorted(cache.glob('*.variants')):
-        if not VARIANTS.match(index.name):
-            continue
+    # Each index and its files on all cores, put together in the indexes' order as one thread did: 42,848 indexes and two
+    # stats each took most of a minute of every express update on the external disk (2026-11-16: 649 us for one index read
+    # alone, 73 us with 16 threads; scratch/runs/2026-11/express-speed/io-probe.log).
+    def one(index):
         try:
             entries = json.loads(index.read_text())
         except (OSError, ValueError):
-            continue
-        kept = []
+            return None
+        kept, found = [], []
         for entry in entries if isinstance(entries, list) else []:
             name = entry.get('variant') if isinstance(entry, dict) else None
             if not isinstance(name, str) or not VARIANT.match(name):
@@ -149,9 +214,20 @@ def seed_files(cache, verified=None):
                 continue
             metal, refl = cache / f'{name}_b.metal', cache / f'{name}_b.json'
             if metal.is_file() and metal.stat().st_size and refl.is_file():
-                checks.append((name, refl))
-                files[metal.name], files[refl.name] = metal, refl
+                found.append((name, metal, refl))
                 kept.append(entry)
+        return entries, kept, found
+    import concurrent.futures
+    candidates = sorted(p for p in cache.glob('*.variants') if VARIANTS.match(p.name))
+    with concurrent.futures.ThreadPoolExecutor(min(16, (os.cpu_count() or 4) * 2)) as pool:
+        results = list(pool.map(one, candidates, chunksize=256))
+    for index, result in zip(candidates, results):
+        if result is None:
+            continue
+        entries, kept, found = result
+        for name, metal, refl in found:
+            checks.append((name, refl))
+            files[metal.name], files[refl.name] = metal, refl
         if kept:
             files[index.name] = index
             if verified is not None and len(kept) != len(entries):
@@ -162,9 +238,8 @@ def seed_files(cache, verified=None):
         reflection = json.loads(refl.read_text())
         if reflection.get('chain') != CHAIN or reflection.get('key') != name + '_b' or not reflection.get('entry'):
             raise ValueError(f'invalid seed reflection: {refl}')
-    import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(min(16, (os.cpu_count() or 4) * 2)) as pool:
-        for _ in pool.map(check, checks):
+        for _ in pool.map(check, checks, chunksize=256):
             pass
     return (files, indexes) if verified is not None else files
 
@@ -192,6 +267,39 @@ def corpus_inventory(path):
     return inventory
 
 
+def corpus_subset(path, keys, out):
+    """The corpus records of these shaders, written to out in the same form (a quick build's seed translates only them:
+    --only). Returns how many there are; a key the corpus does not hold is left out, as the full seed would have it."""
+    records = []
+    with Path(path).open('rb') as stream:
+        header = stream.read(12)
+        if len(header) != 12 or header[:8] != CORPUS_MAGIC:
+            raise ValueError('invalid shader corpus')
+        count, = struct.unpack('<I', header[8:])
+        for _ in range(count):
+            head = stream.read(14)
+            st, cn, kn, ln = struct.unpack('<IIIH', head)
+            label, control, code = stream.read(ln), stream.read(cn), stream.read(kn)
+            if len(control) != cn or len(code) != kn:
+                raise ValueError('truncated shader corpus')
+            if shader_key(control, code) in keys:
+                records.append(head + label + control + code)
+    if not records:
+        raise ValueError('none of the --only shaders is in the corpus')
+    out = Path(out)
+    out.write_bytes(CORPUS_MAGIC + struct.pack('<I', len(records)) + b''.join(records))
+    return len(records)
+
+
+def only_keys(path):
+    """The 64-hex shader keys of an --only file, one per line."""
+    keys = {line.strip() for line in Path(path).read_text().splitlines() if line.strip()}
+    bad = [k for k in keys if not re.fullmatch('[0-9a-f]{64}', k)]
+    if bad or not keys:
+        raise ValueError(f'{path}: not a list of shader keys' + (f' ({bad[0]})' if bad else ' (empty)'))
+    return keys
+
+
 def require_complete(inventory, keys, done, listed=None):
     missing = sorted(inventory.keys() - set(keys))
     if missing or not done or int(done.group(1)) != len(inventory) or int(done.group(2)) != len(inventory):
@@ -210,6 +318,8 @@ def main():
     p.add_argument('--jobs', type=int, default=4, help='bounded extraction/translation concurrency')
     p.add_argument('--output', type=Path, help='default build/shader-seed/<version>')
     p.add_argument('--logs', type=Path, default=Path('logs'))
+    p.add_argument('--only', type=Path, help='translate only these shaders (one 64-hex key per line): a quick build\'s '
+                   'seed (games/oot/build.py, the title rows\' shaders); the game translates the rest at first use')
     a = p.parse_args()
     if not 1 <= a.jobs <= 32:
         p.error('--jobs must be between 1 and 32')
@@ -232,8 +342,22 @@ def main():
              *(['--listed', a.list] if a.list else [])], a.logs / f'ns2-corpus-{v}.log')
         stamp.write_text(json.dumps(want))
 
+    full_corpus, seed_list = corpus, a.list
+    only = only_keys(a.only) if a.only else None
+    if only:   # the corpus and the list cut to these shaders; the full corpus stays as it is (its stamp), for the next build
+        corpus = corpus.with_name(f'{v}-only.bin')
+        print(f'quick seed: {corpus_subset(full_corpus, only, corpus)} of the {len(only)} shaders asked for are in the corpus', flush=True)
+        if a.list:
+            from shader_list import ShaderList
+            seed_list = corpus.with_name(f'{v}-only-list.tsv')
+            ShaderList.load(a.list).only(only).save(seed_list)
+
     prebuilt = Path('prebuilt/macos-arm64/totk_xlate')
     context = translation_context(prebuilt, a.depth_mode)
+    adopted = adopt_legacy_cache(cache, prebuilt, a.depth_mode)
+    if adopted:
+        print(f'translation cache {adopted.name[:12]} taken over as {context[:12]}: the same translator code (another '
+              f'signature, or the cache was named by the whole file before 2026-11-18); nothing is translated again', flush=True)
     cache = cache / context
     cache.mkdir(parents=True, exist_ok=True)
     # A concurrent App package may replace the shared build/shader-service binary.
@@ -260,7 +384,7 @@ def main():
     with GameSlot(owner='build', purpose=f'{v}: complete offline shader translation', expect_seconds=1200) as slot:
         with log.open('w') as output:
             result = slot.popen([str(a.binary), f'rewritten/{v}', 'seed-shaders', str(corpus),
-                                 *([str(a.list)] if a.list else [])], env=env, stdout=output, stderr=subprocess.STDOUT).wait()
+                                 *([str(seed_list)] if seed_list else [])], env=env, stdout=output, stderr=subprocess.STDOUT).wait()
         if result:
             raise SystemExit(f'seed-shaders failed ({result}); see {log}')
     text = log.read_text(errors='replace')
@@ -284,9 +408,10 @@ def main():
     shaders = sum(n.endswith('_b.metal') for n in files)
     here = Path(__file__).resolve().parent
     inputs = dict(chain=CHAIN, version=v, source_romfs_sha256=romfs_sha, translation_context_sha256=context,
-                  nvn_depth_mode=a.depth_mode, translator_sha256=sha256(prebuilt),
+                  nvn_depth_mode=a.depth_mode, translator_sha256=sha256(prebuilt), translator_code_sha256=code_sha256(prebuilt),
                   shader_list_sha256=sha256(a.list) if a.list else None, corpus_sha256=sha256(corpus),
-                  scripts_sha256={n: sha256(here / n) for n in ('prepare_ns2_seed.py', 'prepare_shader_seed.py', 'shader_list.py')})
+                  scripts_sha256={n: sha256(here / n) for n in ('prepare_ns2_seed.py', 'prepare_shader_seed.py', 'shader_list.py')},
+                  only_sha256=sha256(a.only) if only else None)
     if not indexes and seed_unchanged(out, files, inputs):
         print(f'seed unchanged: its {len(files)} translation files are the ones published, from the same inputs; '
               'kept as it is (no new links, digests or manifest)', flush=True)
@@ -299,7 +424,9 @@ def main():
             (staging / name).write_text(json.dumps(indexes[name], sort_keys=True, separators=(',', ':'), ensure_ascii=False))
             continue
         os.link(src, staging / name) if src.stat().st_dev == staging.stat().st_dev else shutil.copy2(src, staging / name)
-    scope = shader_key_scope(keys, v, romfs_sha)
+    # every shader of the game, also the ones a quick seed leaves out: the runtime takes the scope as the game's shaders
+    # (totk_rt_note_set writes a shader outside it into the player's contribution file as new)
+    scope = shader_key_scope(sorted(corpus_inventory(full_corpus)) if only else keys, v, romfs_sha)
     (staging / 'shader-keys.json').write_text(json.dumps(scope, separators=(',', ':')) + '\n')
     # Unlike the shaders, a complete render-pipeline description needs the game's bind state: the warm-up lists come from
     # the shared list's recorded rows (S / C / R / B / T), each variant named as this seed serves it (shader_list.py
@@ -319,9 +446,10 @@ def main():
     report = dict(schema=1, chain=CHAIN, version=v, game=v, source_romfs_sha256=romfs_sha,
                   translation_context_sha256=context,
                   nvn_depth_mode=a.depth_mode,
-                  runtime_sha256=sha256(a.binary), translator_sha256=sha256(prebuilt),
+                  runtime_sha256=sha256(a.binary), translator_sha256=sha256(prebuilt), translator_code_sha256=code_sha256(prebuilt),
                   shader_list_sha256=sha256(a.list) if a.list else None,
                   corpus_sha256=sha256(corpus), corpus_inputs=want, all_default=True,
+                  only=len(only) if only else None,   # a quick seed: only these shaders (the rest translated at first use)
                   stages={str(st): sum(x['stage'] == st for x in inventory.values()) for st in range(6)},
                   preparation_sha256=sha256(Path(__file__).resolve()), shaders=shaders,
                   corpus_shaders=int(done.group(2)), translated_default=int(done.group(1)),

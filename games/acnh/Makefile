@@ -1,6 +1,16 @@
+# opus, libvpx, ogg and vorbis come from the repository's tools/deps: made once per Mac from pinned sources (no Homebrew).
+# make runs here (games/<game>); set a *_PREFIX to use another build.
+OPUS_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix opus),$(error tools/deps could not make opus))
+VPX_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix libvpx),$(error tools/deps could not make libvpx))
+OGG_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix ogg),$(error tools/deps could not make ogg))
+VORBIS_PREFIX ?= $(or $(shell python3 ../../tools/deps prefix vorbis),$(error tools/deps could not make vorbis))
+
 WORK ?= ACNH_build
 OUT := $(WORK)/build
 NATIVE_OPT ?= -O2
+# The host's bundle id (runtime/game_info.plist), as Tears of the Kingdom's: Metal's archive builder then works in a cache
+# folder of its own, which the pipeline archive needs to write (totk_pipeline_archive_folders.h; the pipeline-archive mode).
+GAME_INFO := -Wl,-sectcreate,__TEXT,__info_plist,runtime/game_info.plist
 
 GFX_SRC := $(wildcard third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nvn/*.m third_party/d2r_gfx/gfx/nvn/*.S third_party/d2r_gfx/gfx/tex/*.c third_party/d2r_gfx/gfx/tex/*.m)
 GFX_OBJECTS := $(patsubst %,$(OUT)/obj/%.o,$(GFX_SRC))
@@ -32,12 +42,16 @@ $(OUT)/obj/%.o: % $(GFX_HEADERS) $(OUT)/version-config.h
 	@mkdir -p "$(dir $@)"
 	xcrun clang $(NATIVE_OPT) -g -Wall -Wextra $(GFX_FLAGS) -c "$<" -o "$@"
 
-$(OUT)/acnh-native: $(RUNTIME_SRC) $(RUNTIME_HEADERS) $(GENERATED) $(GFX_OBJECTS)
-	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Wno-error -Wno-deprecated-declarations \
-	  -Ithird_party/d2r_gfx/gfx/nvn/include -I$(OUT) -include $(OUT)/version-config.h -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include \
-	  -I/opt/homebrew/opt/libvorbis/include -I/opt/homebrew/opt/libogg/include \
-	  $(RUNTIME_SRC) $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a \
-	  /opt/homebrew/opt/libvorbis/lib/libvorbis.a /opt/homebrew/opt/libogg/lib/libogg.a \
+# The game binary and its launcher run on macOS 26 whatever SDK builds them: with no minimum, clang and ld take the
+# SDK's version (Launcher 1.1.5, made on macOS 27, carried runtimes of minos 27.2 that macOS 26 refused, #2395). Set only on
+# these targets (make passes it to what they are made of): the translator and spirv-cross targets keep their own flags.
+$(OUT)/acnh-native: export MACOSX_DEPLOYMENT_TARGET := 26.0
+$(OUT)/acnh-native: $(RUNTIME_SRC) $(RUNTIME_HEADERS) $(GENERATED) $(GFX_OBJECTS) runtime/game_info.plist Makefile
+	xcrun clang -std=c11 $(NATIVE_OPT) $(GAME_INFO) -g -Wall -Wextra -Wno-error -Wno-deprecated-declarations \
+	  -Ithird_party/d2r_gfx/gfx/nvn/include -I$(OUT) -include $(OUT)/version-config.h -I$(OPUS_PREFIX)/include/opus -I$(VPX_PREFIX)/include \
+	  -I$(VORBIS_PREFIX)/include -I$(OGG_PREFIX)/include \
+	  $(RUNTIME_SRC) $(GFX_OBJECTS) $(OPUS_PREFIX)/lib/libopus.a $(VPX_PREFIX)/lib/libvpx.a \
+	  $(VORBIS_PREFIX)/lib/libvorbis.a $(OGG_PREFIX)/lib/libogg.a \
 	  -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics \
 	  -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation \
 	  -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -framework VideoToolbox -framework CoreMedia -o "$@"

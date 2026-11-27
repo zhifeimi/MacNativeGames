@@ -55,10 +55,41 @@ class RecordedWorkFolder(unittest.TestCase):
 
     def test_a_work_folder_on_a_missing_disk_is_an_error_not_a_new_folder_next_to_the_app(self):
         # Pokopia 11-11: the app recorded a folder on a volume deleted since; the fallback would have made one among the apps
-        app = app_with(self.base / 'apps', {'MNGWorkFolder': str(self.base / 'old-volume/build/work')})
-        with self.assertRaisesRegex(build_app.BuildError, 'connect that disk.*--work'):
-            build_app.recorded_work_folder(app, 'TOTK_build')
+        volumes = self.base / 'Volumes'
+        volumes.mkdir()
+        app = app_with(self.base / 'apps', {'MNGWorkFolder': str(volumes / 'old-volume/build/work')})
+        with self.assertRaisesRegex(build_app.BuildError, 'old-volume.*not connected.*connect that disk.*--work'):
+            build_app.recorded_work_folder(app, 'TOTK_build', volumes=volumes)
         self.assertFalse((app.parent / 'TOTK_build').exists())
+        self.assertFalse((volumes / 'old-volume').exists(), 'a folder was made where the disk would be mounted')
+
+    def test_a_folder_left_where_a_disk_was_mounted_is_not_the_disk(self):
+        volumes = self.base / 'Volumes'
+        (volumes / 'old-volume').mkdir(parents=True)   # an empty folder macOS left behind: nothing is mounted there
+        app = app_with(self.base / 'apps', {'MNGWorkFolder': str(volumes / 'old-volume/build/work')})
+        with self.assertRaisesRegex(build_app.BuildError, 'not connected'):
+            build_app.recorded_work_folder(app, 'TOTK_build', volumes=volumes, mounted=lambda folder: False)
+
+    def test_a_work_folder_deleted_with_the_folder_it_was_in_is_made_again_when_its_disk_is_connected(self):
+        # 2026-11-25: /Volumes/mac-win/app/build/oot was deleted together with build/ while the disk stayed connected, and
+        # the Launcher's card said "cannot be updated now ... a disk that is not connected" (user: "为什么不能更新")
+        volumes = self.base / 'Volumes'
+        (volumes / 'mac-win/app').mkdir(parents=True)
+        recorded = volumes / 'mac-win/app/build/oot'
+        app = app_with(volumes / 'mac-win/app', {'MNGWorkFolder': str(recorded)})
+        folder, why = build_app.recorded_work_folder(app, 'OcarinaOfTime_build', volumes=volumes, mounted=lambda folder: folder == volumes / 'mac-win')
+        self.assertEqual(folder, recorded)
+        self.assertIn('made again', why)
+        self.assertFalse((app.parent / 'OcarinaOfTime_build').exists())
+
+    def test_a_work_folder_on_the_system_disk_deleted_with_its_parent_is_made_again(self):
+        volumes = self.base / 'Volumes'
+        volumes.mkdir()
+        recorded = self.base / 'home/Games/work/TOTK'   # not below Volumes: the disk the system runs from
+        app = app_with(self.base / 'apps', {'MNGWorkFolder': str(recorded)})
+        folder, why = build_app.recorded_work_folder(app, 'TOTK_build', volumes=volumes)
+        self.assertEqual(folder, recorded)
+        self.assertIn('made again', why)
 
     def test_a_damaged_info_plist_falls_back(self):
         app = self.base / 'apps/Broken.app'; (app / 'Contents').mkdir(parents=True)
@@ -69,10 +100,15 @@ class RecordedWorkFolder(unittest.TestCase):
 
 class UpdatesUseIt(unittest.TestCase):
     """Both update paths take their default from recorded_work_folder; --work still wins."""
-    def test_tears_and_breath_of_the_wild(self):
+    def test_tears_breath_of_the_wild_and_the_switch_2_games(self):
+        # one default for every game update_runtime.py updates (old_work_name names the folder an app that records none
+        # used, beside it; 32247916 added Bananza and Pokopia, which had only the full build until then)
         source = (ROOT / 'update_runtime.py').read_text()
-        self.assertIn("build_app.recorded_work_folder(app, 'BotW_build' if game == 'botw' else 'TOTK_build')", source)
+        self.assertIn("build_app.recorded_work_folder(app, old_work_name(game))", source)
         self.assertNotIn("else app.parent / ('BotW_build' if game == 'botw' else 'TOTK_build')", source)
+        import update_runtime
+        self.assertEqual({g: update_runtime.old_work_name(g) for g in ('totk', 'botw', 'dkb', 'pkp')},
+                         {'totk': 'TOTK_build', 'botw': 'BotW_build', 'dkb': 'Bananza_build', 'pkp': 'Pokopia_build'})
 
     def test_ocarina_of_time(self):
         source = (ROOT / 'update_runtime.py').read_text()

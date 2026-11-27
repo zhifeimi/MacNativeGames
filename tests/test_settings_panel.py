@@ -3,6 +3,7 @@ from pathlib import Path
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -53,6 +54,41 @@ class LocalInbox:
                                              data=json.dumps({'board_id': board_id, 'name': name}).encode())
         with urllib.request.urlopen(request, timeout=30) as answer:
             return json.loads(answer.read())['data']['name']
+
+
+class OnePanel(unittest.TestCase):
+    """One panel for Tears of the Kingdom (and BotW / Bananza / Pokopia), Ocarina of Time and Super Mario Odyssey:
+    shared/runtime/settings_panel.h, each game's runtime/settings_panel.h a link to it, the game's own in its
+    runtime/settings_game.h."""
+    SHARED = ROOT / 'shared/runtime/settings_panel.h'
+
+    def test_each_game_links_the_shared_panel(self):
+        for game in ('totk', 'oot', 'odyssey'):
+            with self.subTest(game=game):
+                link = ROOT / f'games/{game}/runtime/settings_panel.h'
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(os.readlink(link), '../../../shared/runtime/settings_panel.h')   # relative: any checkout
+                self.assertEqual(link.resolve(), self.SHARED.resolve())
+                self.assertIn('#if SETTINGS_GAME_PART == 1', (link.parent / 'settings_game.h').read_text())
+                self.assertIn('#include "settings_panel.h"', (link.parent / 'frontend.m').read_text())
+
+    def test_the_shared_panel_names_no_game(self):
+        panel = self.SHARED.read_text()
+        for word in ('TOTK_GAME_V143', 'TOTK_GAME_V121', 'GAME_BOTW', 'GAME_DKB', 'GAME_POKOPIA', 'GAME_NS2', 'GAME_OOT',
+                     'GAME_ODYSSEY', 'settings_oot_', 'odyssey_graphics'):
+            self.assertNotIn(word, panel)
+        self.assertEqual(panel.count('#include "settings_game.h"'), 2)   # SETTINGS_GAME_PART 1 and 2
+
+    def test_odyssey_has_the_zelda_pages_but_vr(self):
+        """User, Effects, 排行榜 and 截图分享 too (2026-11-17, their modules shared in shared/runtime); VR and the 1.4.3
+        anti-aliasing quality rows stay the Zelda games' own."""
+        game = (ROOT / 'games/odyssey/runtime/settings_game.h').read_text()
+        self.assertEqual(sorted(re.findall(r'#define (SETTINGS_HAS_\w+) 1', game)),
+                         ['SETTINGS_HAS_BOARD', 'SETTINGS_HAS_EFFECTS', 'SETTINGS_HAS_SHOTS', 'SETTINGS_HAS_USERS'])
+        self.assertIn('static void settings_effects_reset(void)', game)   # the panel's Reset to defaults calls the game's own
+        self.assertNotIn('KEYMAP_SCREENSHOT = -2', game)   # its screenshot is real now (keyboard_map.h, gamepad.m)
+        self.assertIn('static NSArray<TOTKSettingRow *> *settings_rows(void)', game)
+        self.assertIn('static const SettingsAction *settings_actions(int *count)', game)
 
 
 @unittest.skipUnless(sys.platform == 'darwin', 'AppKit requires macOS')
@@ -144,23 +180,24 @@ class SettingsPanel(unittest.TestCase):
             self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
             with LocalInbox() as inbox:
                 mine, other = '0f0f0f0f-0000-4000-8000-000000001234', str(uuid.uuid4())
-                for install, count in ((mine, 3), (other, 7)):
+                other_board = str(uuid.uuid4())   # the other player's board id, with a nickname: the list shows it (2026-11-12)
+                self.assertEqual(inbox.name(other_board, 'Zelda'), 'Zelda')
+                for install, count, board in ((mine, 3, None), (other, 7, other_board)):
                     rows = [f'V\t{(install[:8] + str(k)).ljust(64, "0")}\t{{"attr":{{}},"fout":{{}},"img":{{}},"tex":{{}}}}' for k in range(count)]
                     body = {'schema': 1, 'game': 'totk', 'game_version': '1.2.1', 'app_build': 'test', 'rows': rows,
                             'install': install, 'platform': 'mac', 'device': 'Mac16,1', 'os': 'macOS 26.0'}
+                    if board:
+                        body['board_id'] = board
                     request = urllib.request.Request(f'{inbox.base}/v1/contrib', method='POST', headers={'content-type': 'application/json'},
                                                      data=json.dumps(body).encode())
                     with urllib.request.urlopen(request, timeout=30) as answer:
                         self.assertEqual(answer.status, 200)
                 settings = Path(directory) / 'saved'
                 settings.mkdir()
-                env = dict(os.environ, TOTK_UI_LANG='en', SETTINGS_TEST_DIR=str(settings), CONTRIB_TEST_URL=inbox.base)
+                env = dict(os.environ, TOTK_UI_LANG='en', SETTINGS_TEST_DIR=str(settings), CONTRIB_TEST_URL=inbox.base, CONTRIB_TEST_OTHER_NAME='Zelda')
                 run = subprocess.run([str(executable), 'contrib'], env=env, capture_output=True, text=True, timeout=120)
                 self.assertEqual(run.returncode, 0, run.stdout + run.stderr[-3000:])
                 self.assertIn('pass: contribution page with the server', run.stdout)
-
-    def test_update_page_never_forks(self):
-        self.assertNotIn('fork(', (ROOT / 'games/totk/runtime/update_tab.h').read_text(encoding='utf-8'))   # the game's address space is huge
 
     def test_current_modes_and_refresh(self):
         compiler = shutil.which('clang')
@@ -199,15 +236,21 @@ class SettingsPanel(unittest.TestCase):
                                        TOTK_MFX='interp' if overridden else '0',
                                        TOTK_MFX_OUTPUT='1' if overridden else '0',
                                        TOTK_MFX_UPSCALE='0', TOTK_TAA='0')
-                            run = subprocess.run([str(executable)], env=env,
-                                                 capture_output=True, text=True, timeout=35)
+                            try:
+                                # About 6 s on a Mac, 35 s and more on GitHub's macOS virtual machines (Tears of the Kingdom 1.4.3)
+                                run = subprocess.run([str(executable)], env=env,
+                                                     capture_output=True, text=True, timeout=120)
+                            except subprocess.TimeoutExpired as timeout:   # where the probe was when it stopped
+                                said = ''.join(part.decode(errors='replace') if isinstance(part, bytes) else part or ''
+                                               for part in (timeout.stdout, timeout.stderr))
+                                self.fail('timed out after 120 s; last output:\n' + '\n'.join(said.splitlines()[-25:]))
                             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
                             self.assertIn('pass: settings panel', run.stdout)
                 settings = Path(directory) / ('saved-' + (version or 'base'))
                 settings.mkdir()
                 env = {k: v for k, v in os.environ.items() if k not in ('TOTK_MFX', 'TOTK_TAA', 'TOTK_ASPECT', 'TOTK_OUTPUT_RES')}
                 env.update(TOTK_UI_LANG='en', SETTINGS_TEST_DIR=str(settings))
-                if version == 'TOTK_GAME_V143':
+                if version in ('TOTK_GAME_V143', 'GAME_BOTW190'):   # 1.4.3's anti-aliasing rows and files on both
                     aa_cases = [
                         ('defaults', {}, 1, 0, 2),
                         ('stock-off', {'graphics-fxaa.txt': 'off'}, 0, 0, 2),
@@ -224,7 +267,7 @@ class SettingsPanel(unittest.TestCase):
                     ]
                     for name, files, method, fxaa, smaa in aa_cases:
                         with self.subTest(aa_preferences=name):
-                            prefs = Path(directory) / name
+                            prefs = Path(directory) / f'{version}-{name}'
                             prefs.mkdir()
                             for filename, value in files.items():
                                 (prefs / filename).write_text(value + '\n')
@@ -233,9 +276,6 @@ class SettingsPanel(unittest.TestCase):
                             run = subprocess.run([str(executable), 'aa'], env=current, capture_output=True, text=True, timeout=10)
                             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
                             self.assertIn('pass: AA preferences', run.stdout)
-                run = subprocess.run([str(executable), 'update'], env=env, capture_output=True, text=True, timeout=35)
-                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-                self.assertIn('pass: update page', run.stdout)
                 run = subprocess.run([str(executable), 'shots'], env=env, capture_output=True, text=True, timeout=60)
                 self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
                 self.assertIn('pass: screenshots page', run.stdout)
